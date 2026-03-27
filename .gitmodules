@@ -1,0 +1,9 @@
+[submodule "lingbot-world"]
+	path = lingbot-world
+	url = https://github.com/robbyant/lingbot-world.git
+[submodule "cambrian-s"]
+	path = cambrian-s
+	url = https://github.com/cambrian-mllm/cambrian-s.git
+[submodule "WorldMem"]
+	path = WorldMem
+	url = https://github.com/xizaoqu/WorldMem.git
