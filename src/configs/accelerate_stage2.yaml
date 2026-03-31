@@ -1,0 +1,32 @@
+# Stage2 Accelerate 配置
+# 全参数解冻联合微调（DiT lr=1e-5，memory lr=1e-4）
+# ZeRO-3 + CPU offload：参数、optimizer states 均 offload 到 CPU，最大化显存利用率
+# PENDING[D-03]：Stage2 起点权重待定，使用此配置前需确认 D-03
+
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  zero_stage: 3
+  zero3_init_flag: true
+  zero3_save_16bit_model: true
+  offload_optimizer_device: cpu
+  offload_param_device: cpu
+  overlap_comm: true
+  contiguous_gradients: true
+  stage3_max_live_parameters: 1e9
+  stage3_max_reuse_distance: 1e9
+  stage3_gather_16bit_weights_on_model_save: true
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

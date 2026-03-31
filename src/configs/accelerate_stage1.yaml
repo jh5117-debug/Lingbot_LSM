@@ -1,0 +1,32 @@
+# Stage1 Accelerate 配置
+# DiT 冻结，只训 memory 模块（MemoryCrossAttention + NFPHead + memory_norm）
+# ZeRO-2：只分片 optimizer states 和梯度，不分片参数
+# 适合 Stage1：frozen param 无 optimizer state，显存开销主要来自激活值和模型前向
+
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  zero_stage: 2
+  allgather_partitions: true
+  allgather_bucket_size: 2e8
+  overlap_comm: true
+  reduce_scatter: true
+  reduce_bucket_size: 2e8
+  contiguous_gradients: true
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

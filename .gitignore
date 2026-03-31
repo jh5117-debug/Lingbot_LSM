@@ -1,0 +1,13 @@
+# Reference repos cloned locally for reference only
+refs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Checkpoints / large files
+*.ckpt
+*.pth
+*.bin

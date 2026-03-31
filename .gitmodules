@@ -1,0 +1,12 @@
+[submodule "refs/DiffSynth-Studio"]
+	path = refs/DiffSynth-Studio
+	url = https://github.com/modelscope/DiffSynth-Studio.git
+[submodule "refs/WorldMem"]
+	path = refs/WorldMem
+	url = https://github.com/xizaoqu/WorldMem.git
+[submodule "refs/cambrian-s"]
+	path = refs/cambrian-s
+	url = https://github.com/cambrian-mllm/cambrian-s.git
+[submodule "refs/lingbot-world"]
+	path = refs/lingbot-world
+	url = https://github.com/Robbyant/lingbot-world.git
