@@ -278,22 +278,26 @@ class WanModelWithMemory(WanModel):
             WanModelWithMemory 实例，原有权重不变，新增参数随机初始化
         """
         cfg = base_model.config
+        # NOTE: WanModel.ignore_for_config = ['patch_size', 'cross_attn_norm',
+        #   'qk_norm', 'text_dim', 'window_size']
+        # These five fields are NOT stored in base_model.config by ConfigMixin,
+        # so we read them directly from instance attributes instead.
         model = cls(
             model_type=cfg['model_type'],
             control_type=cfg.get('control_type', 'cam'),
-            patch_size=cfg['patch_size'],
+            patch_size=base_model.patch_size,
             text_len=cfg['text_len'],
             in_dim=cfg['in_dim'],
             dim=cfg['dim'],
             ffn_dim=cfg['ffn_dim'],
             freq_dim=cfg['freq_dim'],
-            text_dim=cfg['text_dim'],
+            text_dim=base_model.text_dim,
             out_dim=cfg['out_dim'],
             num_heads=cfg['num_heads'],
             num_layers=cfg['num_layers'],
-            window_size=cfg['window_size'],
-            qk_norm=cfg['qk_norm'],
-            cross_attn_norm=cfg['cross_attn_norm'],
+            window_size=base_model.window_size,
+            qk_norm=base_model.qk_norm,
+            cross_attn_norm=base_model.cross_attn_norm,
             eps=cfg['eps'],
             memory_layers=memory_layers,
             max_memory_size=max_memory_size,
