@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# 用户配置区 — 修改以下变量后运行 bash run_train_v2.sh
+# ============================================================
+STAGE=1                    # 训练阶段：1（冻结DiT只训Memory）或 2（全参联合微调）
+LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调（显存少50%）
+LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
+
+CKPT_DIR=""                # lingbot-world 预训练权重目录
+DATASET_DIR=""             # CSGO 数据集目录（含 metadata_train.csv）
+OUTPUT_DIR="outputs/train_v2_stage${STAGE}"
+RESUME_FROM=""             # 断点续训路径（留空从头开始）
+
+NUM_EPOCHS=50
+LEARNING_RATE=1e-4         # memory 模块学习率（Stage2 全参时 DiT 用 --lr_dit）
+LR_DIT=1e-5               # Stage2 DiT 学习率
+WEIGHT_DECAY=0.01
+GRADIENT_ACCUMULATION_STEPS=4
+MAX_GRAD_NORM=1.0
+SAVE_EVERY_N_EPOCHS=5
+DATASET_REPEAT=1
+NUM_FRAMES=81
+HEIGHT=480
+WIDTH=832
+NFP_LOSS_WEIGHT=0.1
+
+NUM_GPUS=4                 # GPU 数量（与 accelerate config 对应）
+
+# ============================================================
+# 以下内容通常无需修改
+# ============================================================
+
+# ---------- 路径检查 ----------
+_err=0
+if [ -z "${CKPT_DIR}" ]; then
+    echo "[ERROR] CKPT_DIR 未设置，请在用户配置区填写 lingbot-world 权重目录" >&2
+    _err=1
+fi
+if [ -z "${DATASET_DIR}" ]; then
+    echo "[ERROR] DATASET_DIR 未设置，请在用户配置区填写数据集目录" >&2
+    _err=1
+fi
+if [ "${_err}" -ne 0 ]; then
+    exit 1
+fi
+
+# ---------- 路径计算 ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# ---------- 根据 STAGE 选择 accelerate 配置文件 ----------
+if [ "${STAGE}" -eq 1 ]; then
+    ACCEL_CONFIG="${PROJECT_ROOT}/src/configs/accelerate_stage1.yaml"
+elif [ "${STAGE}" -eq 2 ]; then
+    ACCEL_CONFIG="${PROJECT_ROOT}/src/configs/accelerate_stage2.yaml"
+else
+    echo "[ERROR] STAGE 必须为 1 或 2，当前值：${STAGE}" >&2
+    exit 1
+fi
+
+if [ ! -f "${ACCEL_CONFIG}" ]; then
+    echo "[ERROR] accelerate 配置文件不存在：${ACCEL_CONFIG}" >&2
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+
+echo "====================================================="
+echo "  LingBot-World Memory Enhancement 训练 v2 启动"
+echo "  Stage         : ${STAGE}"
+echo "  LoRA rank     : ${LORA_RANK}"
+echo "  Accelerate cfg: ${ACCEL_CONFIG}"
+echo "  num_processes : ${NUM_GPUS}"
+echo "  OUTPUT_DIR    : ${OUTPUT_DIR}"
+echo "====================================================="
+
+# ---------- 拼接 accelerate launch 命令 ----------
+CMD=(
+    accelerate launch
+    --config_file "${ACCEL_CONFIG}"
+    --num_processes "${NUM_GPUS}"
+    "${PROJECT_ROOT}/src/pipeline/train_v2_stage${STAGE}.py"
+    --ckpt_dir                    "${CKPT_DIR}"
+    --dataset_dir                 "${DATASET_DIR}"
+    --output_dir                  "${OUTPUT_DIR}"
+    --stage                       "${STAGE}"
+    --num_epochs                  "${NUM_EPOCHS}"
+    --learning_rate               "${LEARNING_RATE}"
+    --lr_dit                      "${LR_DIT}"
+    --weight_decay                "${WEIGHT_DECAY}"
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
+    --max_grad_norm               "${MAX_GRAD_NORM}"
+    --save_every_n_epochs         "${SAVE_EVERY_N_EPOCHS}"
+    --dataset_repeat              "${DATASET_REPEAT}"
+    --num_frames                  "${NUM_FRAMES}"
+    --height                      "${HEIGHT}"
+    --width                       "${WIDTH}"
+    --nfp_loss_weight             "${NFP_LOSS_WEIGHT}"
+    --gradient_checkpointing
+)
+
+# 可选参数：LoRA（LORA_RANK > 0 时加入）
+if [ "${LORA_RANK}" -gt 0 ]; then
+    CMD+=(--lora_rank "${LORA_RANK}")
+    if [ -n "${LORA_TARGET_MODULES}" ]; then
+        CMD+=(--lora_target_modules "${LORA_TARGET_MODULES}")
+    fi
+fi
+
+# 可选参数：断点续训
+if [ -n "${RESUME_FROM}" ]; then
+    CMD+=(--resume "${RESUME_FROM}")
+fi
+
+echo "执行命令："
+echo "${CMD[*]}"
+echo ""
+
+exec "${CMD[@]}"

@@ -31,6 +31,9 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 if _LINGBOT_WORLD not in sys.path:
     sys.path.insert(0, _LINGBOT_WORLD)
+_PIPELINE_DIR = os.path.join(_ROOT, 'pipeline')
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
 
 from memory_module.memory_bank import MemoryBank, MemoryFrame
 from memory_module.nfp_head import NFPHead
@@ -333,6 +336,99 @@ def test_get_projected_frame_embs_shape():
 
 
 # ---------------------------------------------------------------------------
+# train_v2.py 新组件测试（CPU）
+# ---------------------------------------------------------------------------
+
+def test_train_v2_imports():
+    """train_v2.py：关键类和函数可以正常导入"""
+    try:
+        from train_v2 import (
+            FlowMatchingSchedule,
+            CSGODataset,
+            freeze_for_stage,
+            parse_args,
+        )
+
+        # FlowMatchingSchedule 可以实例化
+        sched = FlowMatchingSchedule()
+        assert hasattr(sched, 'sigmas')
+        assert hasattr(sched, 'valid_train_indices')
+        assert hasattr(sched, 'training_weights')
+
+        logger.info("[PASS] test_train_v2_imports")
+    except Exception as e:
+        logger.error(f"[FAIL] test_train_v2_imports: {e}")
+        raise
+
+
+def test_flow_matching_schedule_initialization():
+    """FlowMatchingSchedule：sigma 范围、权重范围、valid_train_indices 正确性"""
+    try:
+        from train_v2 import FlowMatchingSchedule
+
+        sched = FlowMatchingSchedule()
+
+        # sigma 范围：0~1
+        assert sched.sigmas.min() >= 0 and sched.sigmas.max() <= 1, "sigmas 超出 [0,1]"
+
+        # valid_train_indices：所有 timestep < 947
+        valid_ts = sched.timesteps_schedule[sched.valid_train_indices]
+        assert (valid_ts < 947).all(), "valid_train_indices 包含 timestep >= 947"
+        assert len(sched.valid_train_indices) > 0, "valid_train_indices 为空"
+
+        # 训练权重：非负，且总和约等于 num_train_timesteps
+        assert (sched.training_weights >= 0).all(), "训练权重出现负值"
+
+        logger.info("[PASS] test_flow_matching_schedule_initialization")
+    except Exception as e:
+        logger.error(f"[FAIL] test_flow_matching_schedule_initialization: {e}")
+        raise
+
+
+def test_flow_matching_schedule_sample_timestep():
+    """FlowMatchingSchedule：sample 返回值在有效范围内"""
+    try:
+        from train_v2 import FlowMatchingSchedule
+
+        sched = FlowMatchingSchedule()
+
+        for _ in range(10):
+            idx = sched.valid_train_indices[
+                torch.randint(len(sched.valid_train_indices), (1,)).item()
+            ].item()
+            sigma = sched.sigmas[idx].item()
+            t = sched.timesteps_schedule[idx]
+            weight = sched.training_weights[idx].item()
+
+            assert 0 <= sigma <= 1, f"sigma={sigma} 超出 [0,1]"
+            assert 0 <= t.item() < 947, f"t={t.item()} 超出有效范围"
+            assert weight >= 0, f"weight={weight} 为负值"
+
+        logger.info("[PASS] test_flow_matching_schedule_sample_timestep")
+    except Exception as e:
+        logger.error(f"[FAIL] test_flow_matching_schedule_sample_timestep: {e}")
+        raise
+
+
+def test_freeze_for_stage():
+    """freeze_for_stage：接口存在性和参数正确性"""
+    try:
+        from train_v2 import freeze_for_stage
+        import inspect
+
+        sig = inspect.signature(freeze_for_stage)
+        params = list(sig.parameters.keys())
+        assert 'model' in params, "freeze_for_stage 缺少 model 参数"
+        assert 'stage' in params, "freeze_for_stage 缺少 stage 参数"
+        assert 'lora_rank' in params, "freeze_for_stage 缺少 lora_rank 参数"
+
+        logger.info("[PASS] test_freeze_for_stage")
+    except Exception as e:
+        logger.error(f"[FAIL] test_freeze_for_stage: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -352,6 +448,12 @@ def main():
     test_memory_bank_empty_retrieve()
     test_nfp_head_shapes()
     test_nfp_head_surprise_range()
+
+    # train_v2.py 新组件测试（CPU）
+    test_train_v2_imports()
+    test_flow_matching_schedule_initialization()
+    test_flow_matching_schedule_sample_timestep()
+    test_freeze_for_stage()
 
     # CUDA 测试（自动跳过）
     test_memory_cross_attention_shapes()
