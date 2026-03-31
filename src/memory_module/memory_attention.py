@@ -108,7 +108,16 @@ class MemoryCrossAttention(nn.Module):
         """
         from wan.modules.attention import flash_attention  # lazy import：仅在 forward 调用时加载 wan
 
+        # dtype 对齐：直接读 Linear weight dtype，避免 next(parameters()) 在 ZeRO-3 下不可靠
+        target_dtype = self.q.weight.dtype
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
+        if memory_states is not None and memory_states.dtype != target_dtype:
+            memory_states = memory_states.to(target_dtype)
+
         B, L, _ = x.shape
+        if memory_states is None:
+            return x.new_zeros(B, L, self.dim)
         K = memory_states.shape[1]
 
         # Projection + QK-norm（在 view 之前 norm，与 WanCrossAttention 一致）

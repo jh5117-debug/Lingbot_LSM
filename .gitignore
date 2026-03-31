@@ -1,5 +1,5 @@
-# Reference repos cloned locally for reference only
-refs/
+# Reference repos cloned locally for reference only (not submodules)
+refs/lingbot-csgo-finetune/
 
 # Python
 __pycache__/
