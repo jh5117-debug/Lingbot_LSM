@@ -303,10 +303,24 @@ class WanModelWithMemory(WanModel):
             max_memory_size=max_memory_size,
         )
 
-        # 加载原始权重（MemoryBlockWrapper 内的 block 权重也被正确加载）
-        missing, unexpected = model.load_state_dict(
-            base_model.state_dict(), strict=False
+        # 将 base_model 的 state_dict key 重映射，使 memory_layers 中的
+        # blocks.{i}.xxx → blocks.{i}.block.xxx，以匹配 MemoryBlockWrapper 的结构
+        memory_layer_set = set(
+            memory_layers if memory_layers is not None
+            else list(range(cfg['num_layers']))
         )
+        remapped_sd = {}
+        for key, value in base_model.state_dict().items():
+            new_key = key
+            for i in memory_layer_set:
+                prefix = f"blocks.{i}."
+                if key.startswith(prefix):
+                    new_key = f"blocks.{i}.block." + key[len(prefix):]
+                    break
+            remapped_sd[new_key] = value
+
+        # 加载重映射后的权重（MemoryBlockWrapper 内的 block 权重正确匹配）
+        missing, unexpected = model.load_state_dict(remapped_sd, strict=False)
         if unexpected:
             logger.warning("from_wan_model: unexpected keys: %s", unexpected)
         if missing:
@@ -315,5 +329,9 @@ class WanModelWithMemory(WanModel):
                 "(expected: memory_cross_attn + nfp_head): %s",
                 len(missing), missing[:5],
             )
+
+        # 将新模型移到与 base_model 相同的设备
+        device = next(base_model.parameters()).device
+        model = model.to(device)
 
         return model
