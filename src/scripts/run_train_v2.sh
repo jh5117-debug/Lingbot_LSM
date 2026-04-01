@@ -10,7 +10,7 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 CKPT_DIR=""                # lingbot-world 预训练权重目录
 DATASET_DIR=""             # CSGO 数据集目录（含 metadata_train.csv）
-OUTPUT_DIR="outputs/train_v2_stage${STAGE}"
+OUTPUT_DIR=""
 RESUME_FROM=""             # 断点续训路径（留空从头开始）
 
 NUM_EPOCHS=50
@@ -50,6 +50,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# ---------- 日志目录 & 日志文件 ----------
+LOG_DIR="${PROJECT_ROOT}/logs/run_train_v2"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
+
 # ---------- 根据 STAGE 选择 accelerate 配置文件 ----------
 if [ "${STAGE}" -eq 1 ]; then
     ACCEL_CONFIG="${PROJECT_ROOT}/src/configs/accelerate_stage1.yaml"
@@ -74,6 +79,7 @@ echo "  LoRA rank     : ${LORA_RANK}"
 echo "  Accelerate cfg: ${ACCEL_CONFIG}"
 echo "  num_processes : ${NUM_GPUS}"
 echo "  OUTPUT_DIR    : ${OUTPUT_DIR}"
+echo "  LOG_FILE      : ${LOG_FILE}"
 echo "====================================================="
 
 # ---------- 拼接 accelerate launch 命令 ----------
@@ -118,4 +124,4 @@ echo "执行命令："
 echo "${CMD[*]}"
 echo ""
 
-exec "${CMD[@]}"
+"${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"

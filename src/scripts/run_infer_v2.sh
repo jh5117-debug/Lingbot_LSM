@@ -51,6 +51,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# ---------- 日志目录 & 日志文件 ----------
+LOG_DIR="${PROJECT_ROOT}/logs/run_infer_v2"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
+
 mkdir -p "$(dirname "${SAVE_FILE}")"
 
 echo "====================================================="
@@ -59,6 +64,7 @@ echo "  CKPT_DIR   : ${CKPT_DIR}"
 echo "  IMAGE      : ${IMAGE}"
 echo "  ACTION_PATH: ${ACTION_PATH}"
 echo "  SAVE_FILE  : ${SAVE_FILE}"
+echo "  LOG_FILE   : ${LOG_FILE}"
 echo "====================================================="
 
 # ---------- 拼接推理命令 ----------
@@ -96,4 +102,4 @@ echo "执行命令："
 echo "${CMD[*]}"
 echo ""
 
-exec "${CMD[@]}"
+"${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
