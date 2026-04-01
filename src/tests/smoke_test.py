@@ -336,13 +336,13 @@ def test_get_projected_frame_embs_shape():
 
 
 # ---------------------------------------------------------------------------
-# train_v2.py 新组件测试（CPU）
+# train_v2_stage1.py 新组件测试（CPU）
 # ---------------------------------------------------------------------------
 
 def test_train_v2_imports():
-    """train_v2.py：关键类和函数可以正常导入"""
+    """train_v2_stage1.py：关键类和函数可以正常导入"""
     try:
-        from train_v2 import (
+        from train_v2_stage1 import (
             FlowMatchingSchedule,
             CSGODataset,
             freeze_for_stage,
@@ -364,7 +364,7 @@ def test_train_v2_imports():
 def test_flow_matching_schedule_initialization():
     """FlowMatchingSchedule：sigma 范围、权重范围、valid_train_indices 正确性"""
     try:
-        from train_v2 import FlowMatchingSchedule
+        from train_v2_stage1 import FlowMatchingSchedule
 
         sched = FlowMatchingSchedule()
 
@@ -388,7 +388,7 @@ def test_flow_matching_schedule_initialization():
 def test_flow_matching_schedule_sample_timestep():
     """FlowMatchingSchedule：sample 返回值在有效范围内"""
     try:
-        from train_v2 import FlowMatchingSchedule
+        from train_v2_stage1 import FlowMatchingSchedule
 
         sched = FlowMatchingSchedule()
 
@@ -413,7 +413,7 @@ def test_flow_matching_schedule_sample_timestep():
 def test_freeze_for_stage():
     """freeze_for_stage：接口存在性和参数正确性"""
     try:
-        from train_v2 import freeze_for_stage
+        from train_v2_stage1 import freeze_for_stage
         import inspect
 
         sig = inspect.signature(freeze_for_stage)
@@ -449,7 +449,7 @@ def main():
     test_nfp_head_shapes()
     test_nfp_head_surprise_range()
 
-    # train_v2.py 新组件测试（CPU）
+    # train_v2_stage1.py 新组件测试（CPU）
     test_train_v2_imports()
     test_flow_matching_schedule_initialization()
     test_flow_matching_schedule_sample_timestep()
