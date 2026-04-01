@@ -101,6 +101,8 @@ def _parse_args():
                         help="是否启用 Memory Bank（默认 False，保持后向兼容）")
     parser.add_argument("--memory_max_size", type=int, default=50,
                         help="Memory Bank 最大容量（默认 50）")
+    parser.add_argument("--num_clips", type=int, default=1,
+                        help="Memory 模式下生成的 clip 数量（默认 1，等价于原行为）")
 
     return parser.parse_args()
 
@@ -286,20 +288,34 @@ def _unpatch_pipeline_memory(pipeline):
         del model._original_forward
 
 
-def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int):
+def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
+                        c2ws_plucker_emb=None, nfp_head=None, last_hidden_states=None):
     """用当前 clip 的 VAE latent 更新 MemoryBank（surprise-driven）。
 
-    直接复用 infer.py 的 _update_memory_bank 逻辑。
-    由于 infer_v2 场景下没有预先计算 c2ws_plucker_emb_raw（单 clip 模式），
-    此处用 VAE latent 的帧间 cosine distance 作为 surprise score，
-    pose_emb 占位为 latent 的空间均值（退化为纯 latent 检索）。
+    问题3修复：pose_emb 优先用 get_projected_frame_embs() 计算模型空间嵌入（dim=5120），
+    与 MemoryCrossAttention 期待的 Key/Value 维度一致；退化时用 latent 均值（dim=16）。
 
-    注意：如果 action_path 提供了 poses/intrinsics，可调用
-    infer.py 中的 _compute_plucker_emb 获得真实 pose_emb；
-    这里为保持简洁，直接用 latent 均值作为 pose_emb 索引。
+    问题4修复（随问题3一起）：改用投影嵌入后，K/V 具有真正的视觉语义投影特征。
+
+    问题5修复：surprise score 接口新增 nfp_head 参数，当前保留帧间 cosine distance 退化方案。
+    # TODO：完整对齐需在推理时通过 forward hook 捕获 model.blocks[-1] 的 hidden_states，
+    # 传入 nfp_head(hidden_states) 计算真实预测误差；当前用帧间 cosine distance 代理。
+
+    Args:
+        bank:               MemoryBank 实例
+        video:              当前 clip 的视频帧（Tensor 或类 PIL 格式，与 VAE encode 兼容）
+        pipeline:           WanI2V 管道实例（含 vae）
+        device:             目标设备
+        clip_start_frame:   当前 clip 在完整视频序列中的起始帧索引
+        c2ws_plucker_emb:   可选，[1, C, lat_f, lat_h, lat_w]，来自 dit_cond_dict；
+                            提供时用 get_projected_frame_embs() 计算 5120 维 pose_emb（问题3修复）
+        nfp_head:           可选，NFPHead 实例；接口预留，当前退化为 cosine distance（问题5修复）
+        last_hidden_states: 可选，[1, L, 5120]，forward hook 捕获的 model.blocks[-1] 输出；
+                            提供时用 NFPHead 计算 clip-level surprise（M-1 修复）
     """
     import torch.nn.functional as F
     from memory_module.memory_bank import MemoryBank
+    from memory_module.model_with_memory import WanModelWithMemory
 
     # FIX[B-02]：offload_model=True 时 VAE 可能已在 CPU，需先移回 device
     vae_device = next(pipeline.vae.model.parameters()).device
@@ -312,9 +328,46 @@ def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int):
     lat_f = latent.shape[1]
     vae_stride_t = pipeline.vae_stride[0]
 
+    # 问题3修复：计算 per-frame pose embedding（5120维，与 MemoryCrossAttention 对齐）
+    model = pipeline.low_noise_model
+    frame_embs = None
+    if c2ws_plucker_emb is not None and isinstance(model, WanModelWithMemory):
+        with torch.no_grad():
+            frame_embs = model.get_projected_frame_embs(
+                c2ws_plucker_emb.to(device)
+            )  # [lat_f, dim=5120]
+
+    # BLOCK-2 修复：16维退化路径与 MemoryCrossAttention Linear(5120,5120) 不兼容，
+    # 必须在此处拦截，避免将 dim=16 的 pose_emb 存入 bank 后在 retrieve() 时 crash。
+    if frame_embs is None:
+        logger.warning(
+            "_update_memory_bank: c2ws_plucker_emb not provided or model is not "
+            "WanModelWithMemory (model=%s); skipping bank update to prevent "
+            "MemoryCrossAttention dim mismatch (expected dim=5120).",
+            type(model).__name__,
+        )
+        return
+
+    # M-1 修复：使用 NFPHead 计算 clip-level surprise（若 last_hidden_states 可用）
+    from memory_module.nfp_head import NFPHead as _NFPHead
+    clip_surprise = None
+    if last_hidden_states is not None and hasattr(model, 'nfp_head') and model.nfp_head is not None:
+        with torch.no_grad():
+            _hs = last_hidden_states.to(device).to(
+                next(model.nfp_head.parameters()).dtype
+            )  # [1, L, 5120]
+            _pred = model.nfp_head.forward(_hs)  # [1, z_dim=16]
+            _actual = latent.float()[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, 16] BLOCK-B 修复：最后帧空间均值，与 train_v2_stage1.py:770 一致
+            clip_surprise = _NFPHead.compute_surprise(
+                _pred.float(), _actual
+            ).item()  # scalar
+        logger.info("NFP clip surprise: %.4f", clip_surprise)
+
     for t in range(lat_f):
-        # Surprise score：帧间 cosine distance（第一帧默认 1.0）
-        if t == 0:
+        if clip_surprise is not None:
+            # M-1 修复：使用 NFPHead clip-level surprise（per-clip 粒度对齐训练）
+            surprise = clip_surprise
+        elif t == 0:
             surprise = 1.0
         else:
             prev = latent[:, t - 1].flatten().float()
@@ -322,8 +375,7 @@ def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int):
             cos_sim = F.cosine_similarity(prev.unsqueeze(0), curr.unsqueeze(0)).item()
             surprise = float(1.0 - cos_sim)
 
-        # pose_emb：使用 latent 空间均值作为帧标识嵌入（退化索引）
-        pose_emb = latent[:, t].mean(dim=(-2, -1)).cpu()  # [z_dim]
+        pose_emb = frame_embs[t].cpu()  # [dim=5120]，由 BLOCK-2 保证必为 5120 维
 
         bank.update(
             pose_emb=pose_emb,
@@ -402,48 +454,166 @@ def main():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if args.use_memory and memory_bank is not None:
-        # Memory 推理：检索 → generate → 更新
         from memory_module.model_with_memory import WanModelWithMemory
+        all_videos = []
+        current_img = img
 
-        # 检索 memory（首 clip 时 bank 为空，memory_states=None）
-        memory_states = None
-        if memory_bank.size() > 0:
-            # 使用随机嵌入作为 query（无 camera 信息时的退化查询）
-            query_dim = memory_bank.frames[0].pose_emb.shape[0]
-            query_emb = torch.zeros(query_dim, device=device)
-            retrieved = memory_bank.retrieve(query_emb, top_k=4, device=device)
-            if retrieved is not None:
-                memory_states = retrieved.unsqueeze(0)  # [1, K, dim]
-                logger.info("Retrieved %d memory frames for inference.", retrieved.shape[0])
-
-        # 注入 memory_states 并生成
-        _patch_pipeline_memory(wan_i2v, memory_states)
-        try:
-            video = wan_i2v.generate(
-                args.prompt,
-                img,
-                action_path=args.action_path,
-                max_area=max_area,
-                frame_num=args.frame_num,
-                shift=args.sample_shift,
-                sample_solver="unipc",
-                sampling_steps=args.sample_steps,
-                guide_scale=args.guide_scale,
-                seed=42,
-                offload_model=False,
+        # BLOCK-1 修复：预加载 action_path 中的 poses/actions/intrinsics，
+        # 构建 c2ws_plucker_emb 传入 _update_memory_bank()，确保问题3修复（5120维 pose_emb）生效。
+        _c2ws_plucker_emb_for_bank = None
+        # M-4 修复：广播 memory_states 初始化（多卡分布式推理时各 rank 保持一致）
+        _broadcast_memory_states = None
+        if args.action_path and os.path.isdir(args.action_path):
+            try:
+                import numpy as _np
+                from pipeline.dataloader import build_dit_cond_dict as _build_dit_cond_dict
+                _poses_np = _np.load(os.path.join(args.action_path, "poses.npy"))
+                _actions_np = _np.load(os.path.join(args.action_path, "action.npy"))
+                _intrinsics_np = _np.load(os.path.join(args.action_path, "intrinsics.npy"))
+                _h, _w = [int(x) for x in args.size.split("*")]
+                _cond = _build_dit_cond_dict(
+                    poses=torch.from_numpy(_poses_np).float(),
+                    actions=torch.from_numpy(_actions_np).float(),
+                    intrinsics=torch.from_numpy(_intrinsics_np).float(),
+                    height=_h,
+                    width=_w,
+                )
+                _c2ws_plucker_emb_for_bank = _cond["c2ws_plucker_emb"][0]
+                logger.info(
+                    "Preloaded c2ws_plucker_emb for MemoryBank, shape=%s",
+                    tuple(_c2ws_plucker_emb_for_bank.shape),
+                )
+            except Exception as _e:
+                logger.warning(
+                    "Could not build c2ws_plucker_emb from action_path=%s: %s; "
+                    "MemoryBank updates will be skipped (see BLOCK-1 fix).",
+                    args.action_path, _e,
+                )
+        else:
+            logger.warning(
+                "action_path is None or not a directory (%s); "
+                "MemoryBank updates will be skipped.", args.action_path,
             )
-        finally:
-            _unpatch_pipeline_memory(wan_i2v)
 
-        # 更新 MemoryBank（仅 rank 0 有 video）
-        if rank == 0 and video is not None:
-            _update_memory_bank(
-                bank=memory_bank,
-                video=video,
-                pipeline=wan_i2v,
-                device=device,
-                clip_start_frame=0,
-            )
+        for clip_idx in range(args.num_clips):
+            logger.info("Generating clip %d/%d ...", clip_idx + 1, args.num_clips)
+
+            # M-4：如果有广播来的 memory_states，优先使用（多卡一致性）
+            if _broadcast_memory_states is not None:
+                memory_states = _broadcast_memory_states
+                _broadcast_memory_states = None  # 消费后清空
+                logger.info("Clip %d: using broadcast memory_states (M-4 fix)", clip_idx + 1)
+            else:
+                # 检索 memory（首 clip 时 bank 为空，memory_states=None）
+                memory_states = None
+                if memory_bank.size() > 0:
+                    # HIGH-1 修复：用 get_projected_frame_embs 计算真实 pose query
+                    model_lnm = wan_i2v.low_noise_model
+                    if isinstance(model_lnm, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
+                        with torch.no_grad():
+                            _qfe = model_lnm.get_projected_frame_embs(
+                                _c2ws_plucker_emb_for_bank.to(device)
+                            )  # [lat_f, dim=5120]
+                        query_emb = _qfe[0].to(device)  # [5120]，当前 clip 第一帧 pose emb
+                    else:
+                        query_dim = memory_bank.frames[0].pose_emb.shape[0]
+                        query_emb = torch.zeros(query_dim, device=device)
+                        logger.warning("Clip %d: falling back to zero query (no pose data)", clip_idx + 1)
+                    retrieved = memory_bank.retrieve(query_emb, top_k=4, device=device)
+                    if retrieved is not None:
+                        memory_states = retrieved.unsqueeze(0)  # [1, K, dim]
+                        logger.info("Clip %d: retrieved %d memory frames.", clip_idx + 1, retrieved.shape[0])
+
+            # M-1 修复：注册 forward hook 捕获 model.blocks[-1] hidden_states（供 NFPHead 使用）
+            _nfp_captured_hs = {}
+            _nfp_hook_handle = None
+            _model_lnm = wan_i2v.low_noise_model
+            if isinstance(_model_lnm, WanModelWithMemory):
+                def _nfp_capture_hook(module, inp, out):
+                    hs = out[0] if isinstance(out, (tuple, list)) else out
+                    _nfp_captured_hs['hs'] = hs.detach().cpu()
+                _nfp_hook_handle = _model_lnm.blocks[-1].register_forward_hook(_nfp_capture_hook)
+
+            # 注入 memory_states 并生成
+            _patch_pipeline_memory(wan_i2v, memory_states)
+            try:
+                video = wan_i2v.generate(
+                    args.prompt,
+                    current_img,
+                    action_path=args.action_path,
+                    max_area=max_area,
+                    frame_num=args.frame_num,
+                    shift=args.sample_shift,
+                    sample_solver="unipc",
+                    sampling_steps=args.sample_steps,
+                    guide_scale=args.guide_scale,
+                    seed=42 + clip_idx,
+                    offload_model=False,
+                )
+            finally:
+                _unpatch_pipeline_memory(wan_i2v)
+                # M-1 修复：移除 forward hook
+                if _nfp_hook_handle is not None:
+                    _nfp_hook_handle.remove()
+                    _nfp_hook_handle = None
+            _last_hs_for_nfp = _nfp_captured_hs.pop('hs', None)
+
+            if rank == 0 and video is not None:
+                # HIGH-3 修复：确保存入 all_videos 的是 torch.Tensor
+                import numpy as _np_h3
+                _video_tensor = torch.from_numpy(video.copy()) if isinstance(video, _np_h3.ndarray) else video
+                all_videos.append(_video_tensor)
+                # 更新 Memory Bank（BLOCK-1 修复：传入 c2ws_plucker_emb）
+                _update_memory_bank(
+                    bank=memory_bank,
+                    video=video,
+                    pipeline=wan_i2v,
+                    device=device,
+                    clip_start_frame=clip_idx * args.frame_num,
+                    c2ws_plucker_emb=_c2ws_plucker_emb_for_bank,
+                    last_hidden_states=_last_hs_for_nfp,
+                )
+                # 使用最后一帧作为下一 clip 的初始帧
+                # video shape: [C=3, T, H, W]，取最后时间步 [:, -1] → [C, H, W]
+                from PIL import Image as PILImage
+                import numpy as _np_frame
+                last_frame_chw = video[:, -1]  # [C=3, H, W]
+                if hasattr(last_frame_chw, 'cpu'):
+                    last_frame_chw = last_frame_chw.cpu().float().numpy()
+                # CHW → HWC，[-1,1] → [0,255]
+                last_frame_hwc = last_frame_chw.transpose(1, 2, 0)
+                last_frame_np = (last_frame_hwc * 127.5 + 127.5).clip(0, 255).astype(_np_frame.uint8)
+                current_img = PILImage.fromarray(last_frame_np)
+                logger.info("Clip %d: memory bank updated. Size=%d", clip_idx + 1, memory_bank.size())
+
+            # M-4 修复：广播 memory_states 给所有 rank（仅多卡 Ulysses 模式需要）
+            if world_size > 1 and dist.is_initialized():
+                # rank 0 预计算下一 clip 的 memory_states 供广播
+                if rank == 0 and memory_bank.size() > 0:
+                    _m4_model = wan_i2v.low_noise_model
+                    if isinstance(_m4_model, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
+                        with torch.no_grad():
+                            _m4_qfe = _m4_model.get_projected_frame_embs(
+                                _c2ws_plucker_emb_for_bank.to(device)
+                            )
+                        _m4_q = _m4_qfe[0].to(device)
+                        _m4_retrieved = memory_bank.retrieve(_m4_q, top_k=4, device=device)
+                        _m4_states = _m4_retrieved.unsqueeze(0) if _m4_retrieved is not None else None
+                    else:
+                        _m4_states = None
+                else:
+                    _m4_states = None
+                # 广播 memory_states（使用 broadcast_object_list 支持 None 和 Tensor）
+                _m4_bcast = [_m4_states]
+                dist.broadcast_object_list(_m4_bcast, src=0)
+                _broadcast_memory_states = _m4_bcast[0]
+                if _broadcast_memory_states is not None:
+                    _broadcast_memory_states = _broadcast_memory_states.to(device)
+            else:
+                _broadcast_memory_states = None
+
+        # 拼接所有 clips
+        video = torch.cat(all_videos, dim=1) if all_videos else None  # BLOCK-A 修复：沿时间维度 T(dim=1) 拼接，[C, T*N, H, W]
 
     else:
         # 无 memory 路径：与 inference_csgo.py 完全一致

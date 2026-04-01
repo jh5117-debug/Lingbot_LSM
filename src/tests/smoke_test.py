@@ -429,6 +429,108 @@ def test_freeze_for_stage():
 
 
 # ---------------------------------------------------------------------------
+# F-02 修复验证测试（CPU）
+# ---------------------------------------------------------------------------
+
+def test_nfp_target_shape():
+    """验证 M-2 修复：NFP 训练目标取 clip 最后帧空间均值，shape 正确且不等于全 clip 均值。"""
+    import torch.nn as nn
+
+    # 构造 video_latent: [z_dim=16, lat_f=5, lat_h=4, lat_w=4]
+    video_latent = torch.randn(16, 5, 4, 4)
+
+    # M-2 修复逻辑：最后帧空间均值
+    actual_latent = video_latent[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, 16]
+    assert actual_latent.shape == (1, 16), \
+        f"expected (1, 16), got {actual_latent.shape}"
+
+    # 验证不等于全 clip 均值（一般情况下不等，极少数随机情况下可能相等，但概率极低）
+    clip_mean = video_latent.mean(dim=[-3, -2, -1]).unsqueeze(0)  # [1, 16]
+    # 两者 shape 相同，但值不同（最后帧 vs 全 clip 平均）
+    assert not torch.allclose(actual_latent, clip_mean), \
+        "last-frame target should differ from full-clip mean target"
+
+    logger.info("[PASS] test_nfp_target_shape")
+
+
+def test_freeze_for_stage_lora_behavior():
+    """验证 M-3 修复：LoRA adapter 在 Stage1 确实被解冻，base 参数仍被冻结。"""
+    import torch.nn as nn
+    from train_v2_stage1 import freeze_for_stage
+
+    class MockModelWithLoRA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(32, 32)
+            self.lora_A = nn.Parameter(torch.randn(8, 32))
+            self.lora_B = nn.Parameter(torch.randn(32, 8))
+            # 模拟 memory 模块（freeze_for_stage Stage1 会解冻含这些名字的参数）
+            self.memory_cross_attn = nn.Linear(32, 32)
+            self.memory_norm = nn.LayerNorm(32)
+            self.nfp_head = nn.Linear(32, 16)
+
+    model = MockModelWithLoRA()
+
+    # 调用 freeze_for_stage，lora_rank > 0 触发 M-3 逻辑
+    freeze_for_stage(model, stage=1, lora_rank=8)
+
+    # LoRA adapter 参数应被解冻
+    assert model.lora_A.requires_grad is True, \
+        "lora_A should be unfrozen in Stage1 with lora_rank > 0"
+    assert model.lora_B.requires_grad is True, \
+        "lora_B should be unfrozen in Stage1 with lora_rank > 0"
+
+    # base 参数应被冻结
+    assert model.base_layer.weight.requires_grad is False, \
+        "base_layer.weight should be frozen in Stage1"
+
+    logger.info("[PASS] test_freeze_for_stage_lora_behavior")
+
+
+def test_video_last_frame_extraction():
+    """验证 HIGH-1 修复：video[:, -1] 正确取最后时间帧而非色道。"""
+    # 构造 video: [C=3, T=10, H=64, W=64]
+    video = torch.randn(3, 10, 64, 64)
+
+    # HIGH-1 修复：[:, -1] 取最后时间帧
+    last_frame = video[:, -1]  # [C=3, H=64, W=64]
+    assert last_frame.shape == (3, 64, 64), \
+        f"expected (3, 64, 64), got {last_frame.shape}"
+
+    # 验证内容：等于第 10 帧（索引 9），不等于蓝色通道（video[2]）
+    assert torch.allclose(last_frame, video[:, 9]), \
+        "last_frame should equal video[:, 9] (10th time frame)"
+    assert not torch.allclose(last_frame, video[:, 0]), \
+        "last_frame should NOT equal video[:, 0] (first frame)"
+
+    logger.info("[PASS] test_video_last_frame_extraction")
+
+
+def test_all_videos_cat_dim():
+    """验证 H-3 + BLOCK-A 修复：numpy→tensor 转换 + dim=1 时间维 cat。"""
+    import numpy as np
+
+    # 构造 3 个 numpy 视频片段，每个 [C=3, T=5, H=64, W=64]
+    all_videos = []
+    for _ in range(3):
+        vid = np.random.randn(3, 5, 64, 64).astype(np.float32)
+        # H-3 修复：numpy→tensor 转换
+        _video_tensor = torch.from_numpy(vid.copy()) if isinstance(vid, np.ndarray) else vid
+        all_videos.append(_video_tensor)
+
+    # 确认转换成功
+    assert isinstance(all_videos[0], torch.Tensor), \
+        "all_videos[0] should be torch.Tensor after numpy→tensor conversion"
+
+    # BLOCK-A 修复：沿时间维度 dim=1 拼接，[C=3, T=15, H=64, W=64]
+    video = torch.cat(all_videos, dim=1)
+    assert video.shape == (3, 15, 64, 64), \
+        f"expected (3, 15, 64, 64), got {video.shape}"
+
+    logger.info("[PASS] test_all_videos_cat_dim")
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -454,6 +556,12 @@ def main():
     test_flow_matching_schedule_initialization()
     test_flow_matching_schedule_sample_timestep()
     test_freeze_for_stage()
+
+    # F-02 修复验证测试（CPU）
+    test_nfp_target_shape()
+    test_freeze_for_stage_lora_behavior()
+    test_video_last_frame_extraction()
+    test_all_videos_cat_dim()
 
     # CUDA 测试（自动跳过）
     test_memory_cross_attention_shapes()

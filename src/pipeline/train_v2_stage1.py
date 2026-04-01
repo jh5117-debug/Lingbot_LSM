@@ -326,6 +326,18 @@ def freeze_for_stage(model: nn.Module, stage: int, lora_rank: int) -> list:
         # 解冻 NFPHead
         model.nfp_head.requires_grad_(True)
 
+        # M-3 修复：LoRA 模式下额外解冻 LoRA adapter（lora_A/lora_B）
+        # 避免 setup_lora() 注入的 adapter 被 model.requires_grad_(False) 误冻结
+        if lora_rank > 0:
+            n_lora_params = 0
+            for name, param in model.named_parameters():
+                if 'lora_A' in name or 'lora_B' in name:
+                    param.requires_grad_(True)
+                    n_lora_params += 1
+            logging.info(
+                f"Stage1 LoRA: 额外解冻 {n_lora_params} 个 LoRA adapter 参数（lora_A/lora_B）"
+            )
+
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         trainable_count = sum(p.numel() for p in trainable_params)
         total_count = sum(p.numel() for p in model.parameters())
@@ -721,8 +733,15 @@ class LingBotMemoryTrainer:
         hook_handle = last_block.register_forward_hook(_nfp_hook)
 
         try:
-            # Forward（memory_states=None：训练时不注入 memory bank）
+            # Forward（训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度）
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                # Stage1 训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度
+                # shape: [B=1, K=1, dim=model.dim]，零初始化，与推理时真实 memory 接口相同
+                dummy_memory = torch.zeros(
+                    1, 1, model.dim,
+                    device=noisy_latent.device,
+                    dtype=torch.bfloat16,
+                )
                 pred = model(
                     [noisy_latent],
                     t=t,
@@ -730,7 +749,7 @@ class LingBotMemoryTrainer:
                     seq_len=seq_len,
                     y=[y],
                     dit_cond_dict=dit_cond_dict,
-                    memory_states=None,  # Memory Enhancement：训练时不注入 memory bank
+                    memory_states=dummy_memory,  # Stage1：dummy zero memory，激活 MemoryCrossAttention 梯度路径
                 )[0]
 
             # Diffusion loss（与 v2 完全对齐：排除第一帧）
@@ -745,10 +764,10 @@ class LingBotMemoryTrainer:
                 nfp_head = model.nfp_head
                 pred_latent = nfp_head(hidden_states)  # [B, z_dim=16]
 
-                # actual_latent: video_latent.mean over spatial → [1, 16]
-                # video_latent shape: [16, lat_f, lat_h, lat_w]（单样本无 batch 维）
-                # 对齐 old train.py：.mean(dim=[-3,-2,-1]).unsqueeze(0) → [1, 16]
-                actual_latent = video_latent.mean(dim=[-3, -2, -1]).unsqueeze(0)  # [1, 16]
+                # M-2 修复：用 clip 最后一帧空间均值替代全 clip 全局均值，
+                # 更接近"预测下一帧"的语义（下一帧 ≈ clip 最后一帧的延续）
+                # video_latent shape: [z_dim=16, lat_f, lat_h, lat_w]
+                actual_latent = video_latent[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, z_dim=16] 最后帧
 
                 nfp_loss_dict = NFPHead.compute_loss(
                     pred_latent, actual_latent,
@@ -1003,7 +1022,9 @@ def main():
                     )
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                        # H-2 修复：使用 accelerator-prepared model.parameters() 替代 pre-prepare 的
+                        # trainable_params 列表，避免 ZeRO-3 下参数指针已迁移导致梯度裁剪静默失效
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
