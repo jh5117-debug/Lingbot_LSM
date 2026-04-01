@@ -1,0 +1,23 @@
+export PYTHONWARNINGS="ignore"
+wandb offline
+python -m main +name=infer \
+    experiment.tasks=[test] \
+    dataset.validation_multiplier=1 \
+    +dataset.seed=42 \
+    +diffusion_model_path=zeqixiao/worldmem_checkpoints/diffusion_only.ckpt \
+    +vae_path=zeqixiao/worldmem_checkpoints/vae_only.ckpt \
+    +customized_load=true \
+    +seperate_load=true \
+    dataset.n_frames=8 \
+    dataset.save_dir=data/minecraft \
+    +dataset.n_frames_valid=700 \
+    algorithm.diffusion.sampling_timesteps=20 \
+    +algorithm.memory_condition_length=8 \
+    +algorithm.lpips_batch_size=16 \
+    +algorithm.log_video=true \
+    +algorithm.save_local=true \
+    +dataset.customized_validation=true \
+    +algorithm.n_tokens=8 \
+    algorithm.context_frames=600 \
+    experiment.test.batch_size=1 \
+    experiment.test.limit_batch=10 \
