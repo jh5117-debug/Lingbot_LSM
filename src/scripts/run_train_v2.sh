@@ -8,9 +8,9 @@ STAGE=1                    # 训练阶段：1（冻结DiT只训Memory）或 2（
 LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调（显存少50%）
 LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
-CKPT_DIR=""                # lingbot-world 预训练权重目录
-DATASET_DIR=""             # CSGO 数据集目录（含 metadata_train.csv）
-OUTPUT_DIR=""
+CKPT_DIR="/home/nvme03/wlx/Memory/models/lingbot-world-base-act"                # lingbot-world 预训练权重目录
+DATASET_DIR="/home/nvme03/wlx/Memory/datasets/processed_csgo_v2"             # CSGO 数据集目录（含 metadata_train.csv）
+OUTPUT_DIR="/home/nvme03/wlx/Memory/outputs/train_v2_stage1"
 RESUME_FROM=""             # 断点续训路径（留空从头开始）
 
 NUM_EPOCHS=50
