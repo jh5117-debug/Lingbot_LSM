@@ -26,11 +26,14 @@ HEIGHT=480
 WIDTH=832
 NFP_LOSS_WEIGHT=0.1
 
-NUM_GPUS=4                 # GPU 数量（与 accelerate config 对应）
+CUDA_VISIBLE_DEVICES="0,1,2,3"  # 使用哪几张 GPU，例如 "0"、"0,1"、"0,1,2,3,4,5,6,7"
 
 # ============================================================
 # 以下内容通常无需修改
 # ============================================================
+
+export CUDA_VISIBLE_DEVICES
+NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l | xargs)
 
 # ---------- 路径检查 ----------
 _err=0
@@ -74,12 +77,13 @@ mkdir -p "${OUTPUT_DIR}"
 
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 训练 v2 启动"
-echo "  Stage         : ${STAGE}"
-echo "  LoRA rank     : ${LORA_RANK}"
-echo "  Accelerate cfg: ${ACCEL_CONFIG}"
-echo "  num_processes : ${NUM_GPUS}"
-echo "  OUTPUT_DIR    : ${OUTPUT_DIR}"
-echo "  LOG_FILE      : ${LOG_FILE}"
+echo "  Stage              : ${STAGE}"
+echo "  LoRA rank          : ${LORA_RANK}"
+echo "  Accelerate cfg     : ${ACCEL_CONFIG}"
+echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "  NUM_GPUS           : ${NUM_GPUS}"
+echo "  OUTPUT_DIR         : ${OUTPUT_DIR}"
+echo "  LOG_FILE           : ${LOG_FILE}"
 echo "====================================================="
 
 # ---------- 拼接 accelerate launch 命令 ----------

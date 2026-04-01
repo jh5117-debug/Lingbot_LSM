@@ -25,9 +25,13 @@ SAMPLE_SHIFT=10.0
 GUIDE_SCALE=5.0
 SIZE="480*832"
 
+CUDA_VISIBLE_DEVICES="0"  # 使用哪张 GPU 做推理，例如 "0"、"1"、"0,1"
+
 # ============================================================
 # 以下内容通常无需修改
 # ============================================================
+
+export CUDA_VISIBLE_DEVICES
 
 # ---------- 路径检查 ----------
 _err=0
@@ -60,6 +64,7 @@ mkdir -p "$(dirname "${SAVE_FILE}")"
 
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 推理 v2 启动"
+echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  CKPT_DIR   : ${CKPT_DIR}"
 echo "  IMAGE      : ${IMAGE}"
 echo "  ACTION_PATH: ${ACTION_PATH}"
