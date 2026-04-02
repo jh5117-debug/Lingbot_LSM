@@ -45,39 +45,55 @@ HAS_CUDA = torch.cuda.is_available()
 # ---------------------------------------------------------------------------
 
 def test_memory_bank_update_and_retrieve():
-    """update / retrieve / size / clear 基本行为。"""
+    """update / retrieve / size / clear 基本行为（v2 structured API）。"""
     bank = MemoryBank(max_size=4)
     dim = 64
 
-    # 插入 4 帧
+    # 插入 4 帧（v2 API: key_state + value_visual）
     for i in range(4):
-        pose_emb = torch.randn(dim)
-        latent = torch.randn(16, 4, 4)
-        bank.update(pose_emb, latent, surprise_score=float(i) * 0.3, timestep=i)
+        key_state = torch.randn(dim)
+        value_visual = torch.randn(dim)
+        bank.update(key_state, value_visual, surprise_score=float(i) * 0.3, timestep=i, chunk_id=0)
 
     assert bank.size() == 4, f"expected 4, got {bank.size()}"
 
     # 插入第 5 帧（surprise=2.0 > 所有已存帧），应替换 surprise 最低的帧（i=0, score=0.0）
-    bank.update(torch.randn(dim), torch.randn(16, 4, 4), surprise_score=2.0, timestep=100)
+    bank.update(torch.randn(dim), torch.randn(dim), surprise_score=2.0, timestep=100, chunk_id=0)
     assert bank.size() == 4, "size should remain 4 after eviction"
     scores = [f.surprise_score for f in bank.frames]
     assert 0.0 not in scores, "lowest surprise frame should have been evicted"
 
     # 插入低 surprise 帧（不应进入）
-    bank.update(torch.randn(dim), torch.randn(16, 4, 4), surprise_score=0.0, timestep=200)
+    bank.update(torch.randn(dim), torch.randn(dim), surprise_score=0.0, timestep=200, chunk_id=0)
     assert bank.size() == 4
     assert all(f.surprise_score > 0.0 for f in bank.frames), \
         "0.0 surprise frame should not be stored"
 
-    # retrieve top-2
+    # retrieve top-2 → v2 returns dict
     query = torch.randn(dim)
     retrieved = bank.retrieve(query, top_k=2)
     assert retrieved is not None
-    assert retrieved.shape == (2, dim), f"expected (2, {dim}), got {retrieved.shape}"
+    assert isinstance(retrieved, dict), f"retrieve should return dict, got {type(retrieved)}"
+    assert 'key_states' in retrieved
+    assert 'value_visuals' in retrieved
+    assert 'similarities' in retrieved
+    assert retrieved['key_states'].shape == (2, dim), f"expected (2, {dim}), got {retrieved['key_states'].shape}"
+    assert retrieved['value_visuals'].shape == (2, dim)
+    assert retrieved['similarities'].shape == (2,)
 
     # retrieve 超过 bank 大小时取全部
     retrieved_all = bank.retrieve(query, top_k=10)
-    assert retrieved_all.shape[0] == 4
+    assert retrieved_all['key_states'].shape[0] == 4
+
+    # get_stats()
+    stats = bank.get_stats()
+    assert 'memory/bank_size' in stats
+    assert 'memory/store_count' in stats
+    assert 'memory/evict_count' in stats
+    assert stats['memory/bank_size'] == 4.0
+
+    # increment_age
+    bank.increment_age()
 
     # clear
     bank.clear()
@@ -91,7 +107,7 @@ def test_memory_bank_empty_retrieve():
     """空 bank 的 retrieve 应返回 None。"""
     bank = MemoryBank(max_size=8)
     assert bank.retrieve(torch.randn(32)) is None
-    assert bank.get_all_states() is None
+    assert bank.size() == 0
     logger.info("[PASS] test_memory_bank_empty_retrieve")
 
 
@@ -129,6 +145,39 @@ def test_nfp_head_shapes():
     assert losses_no_mask['total'] >= 0
 
     logger.info("[PASS] test_nfp_head_shapes")
+
+
+def test_nfp_head_per_frame():
+    """v2 per-frame NFP: forward_per_frame / compute_surprise_per_frame / compute_loss_per_frame。"""
+    dim, z_dim = 128, 8
+    B, lat_f, spatial = 1, 11, 20
+    L = lat_f * spatial
+
+    head = NFPHead(dim=dim, z_dim=z_dim)
+    head.eval()
+
+    hs = torch.randn(B, L, dim)
+
+    # Per-frame forward
+    pred = head.forward_per_frame(hs, lat_f, spatial)
+    assert pred.shape == (B, lat_f, z_dim), f"expected ({B}, {lat_f}, {z_dim}), got {pred.shape}"
+
+    # Per-frame surprise
+    actual = torch.randn(B, lat_f, z_dim)
+    surprise = NFPHead.compute_surprise_per_frame(pred, actual)
+    assert surprise.shape == (B, lat_f), f"expected ({B}, {lat_f}), got {surprise.shape}"
+
+    # Per-frame loss
+    video_latent = torch.randn(z_dim, lat_f, 4, 4)
+    loss_dict = NFPHead.compute_loss_per_frame(pred, video_latent)
+    assert 'mse' in loss_dict
+    assert 'cosine' in loss_dict
+    assert 'per_frame_surprise' in loss_dict
+    assert loss_dict['per_frame_surprise'].shape == (lat_f - 1,), \
+        f"expected ({lat_f - 1},), got {loss_dict['per_frame_surprise'].shape}"
+    assert loss_dict['total'] >= 0
+
+    logger.info("[PASS] test_nfp_head_per_frame")
 
 
 def test_nfp_head_surprise_range():
@@ -549,6 +598,7 @@ def main():
     test_memory_bank_update_and_retrieve()
     test_memory_bank_empty_retrieve()
     test_nfp_head_shapes()
+    test_nfp_head_per_frame()
     test_nfp_head_surprise_range()
 
     # train_v2_stage1.py 新组件测试（CPU）

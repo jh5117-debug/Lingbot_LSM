@@ -1,15 +1,15 @@
 """
-memory_module — Surprise-Driven Memory Bank for LingBot-World
+memory_module -- Surprise-Driven Memory Bank for LingBot-World (v2)
 
-新增模块，不修改 lingbot-world 原始代码。
+New modules, no modifications to lingbot-world source.
 
-主要组件：
-    MemoryBank          — 存储 / 检索历史帧（按 Surprise score 筛选）
-    MemoryFrame         — 单帧记忆数据结构
-    MemoryCrossAttention — 历史帧 Cross-Attention（Query=当前帧，KV=历史帧）
-    NFPHead             — Next Frame Prediction Head（Surprise score 来源）
-    WanModelWithMemory  — 带记忆机制的 WanModel（继承，不修改原始代码）
-    MemoryBlockWrapper  — 单 block 包裹器（WanAttentionBlock + MemoryCrossAttention）
+Core components:
+    MemoryBank          -- Store / retrieve historical frames (surprise-driven eviction)
+    MemoryFrame         -- Single frame memory data structure
+    MemoryCrossAttention -- Historical frame Cross-Attention (Query=current, KV=history, gated)
+    NFPHead             -- Next Frame Prediction Head (per-frame surprise source)
+    WanModelWithMemory  -- Memory-enhanced WanModel (inheritance, no source modification)
+    MemoryBlockWrapper  -- Single block wrapper (WanAttentionBlock + MemoryCrossAttention)
 """
 
 from .memory_bank import MemoryBank, MemoryFrame
@@ -18,9 +18,9 @@ from .nfp_head import NFPHead
 __all__ = ['MemoryBank', 'MemoryFrame', 'NFPHead']
 
 try:
-    from .memory_attention import MemoryCrossAttention
+    from .memory_attention import MemoryCrossAttention, RMSNorm
     from .model_with_memory import MemoryBlockWrapper, WanModelWithMemory
-    __all__ += ['MemoryCrossAttention', 'MemoryBlockWrapper', 'WanModelWithMemory']
+    __all__ += ['MemoryCrossAttention', 'RMSNorm', 'MemoryBlockWrapper', 'WanModelWithMemory']
 except (ImportError, RuntimeError):
-    # CUDA 不可用时（如登录节点）跳过，按需直接 import 对应子模块
+    # CUDA unavailable (e.g. login node): skip, import submodules directly as needed
     pass

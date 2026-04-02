@@ -1,8 +1,14 @@
 """
-memory_attention.py — Memory Cross-Attention Module
+memory_attention.py — Memory Cross-Attention Module (v2)
 
 结构参考 lingbot-world 的 WanCrossAttention，Query 来自当前帧特征，
-Key/Value 来自 MemoryBank 检索到的历史帧 pose_emb。
+Key/Value 来自 MemoryBank 检索到的历史帧嵌入。
+
+v2 变更（对应 MEMORY_FIX_REVIEW_AND_WANDB_PLAN.md 任务 C）：
+  - 增加可学习标量 gate（nn.Parameter(torch.zeros(1))），
+    保证初始化时 memory 分支输出为零，不破坏预训练权重。
+  - 参考 WorldMem dit.py L304: x = x + gate(r_attn(...), r_gate_msa)
+  - forward 内部计算 attn_out_norm / gate 值，供外部日志采集
 
 与 WanCrossAttention 的区别：
   - Key/Value 是 memory_states [B, K, dim]，而非文本嵌入
@@ -11,7 +17,7 @@ Key/Value 来自 MemoryBank 检索到的历史帧 pose_emb。
 
 参考：
   - lingbot-world: wan/modules/model.py WanCrossAttention（接口风格）
-  - lingbot-world: wan/modules/attention.py flash_attention（底层计算）
+  - WorldMem: algorithms/worldmem/models/dit.py L304 gate 机制
 """
 
 import logging
@@ -30,7 +36,7 @@ if _LINGBOT_WORLD not in sys.path:
     sys.path.insert(0, _LINGBOT_WORLD)
 
 # flash_attention 已移至 MemoryCrossAttention.forward() 内懒加载，
-# 避免模块导入时触发 wan/__init__.py → T5EncoderModel → torch.cuda.current_device()
+# 避免模块导入时触发 wan/__init__.py -> T5EncoderModel -> torch.cuda.current_device()
 
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -55,10 +61,10 @@ class RMSNorm(nn.Module):
 
 
 class MemoryCrossAttention(nn.Module):
-    """历史帧 Memory Cross-Attention。
+    """历史帧 Memory Cross-Attention (v2: 含 zero-init gate)。
 
     Query 来自当前帧的隐藏状态 x，Key/Value 来自 Memory Bank 检索到的历史帧。
-    结构与 WanCrossAttention 保持一致（无 RoPE，支持 Flash Attention）。
+    输出经过可学习标量 gate 缩放，gate 初始化为 0，保证初始时 memory 分支为零。
 
     Args:
         dim:       模型隐藏维度（A14B 配置为 5120）
@@ -90,6 +96,14 @@ class MemoryCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        # Zero-init gate：初始化为 0，训练过程中学习打开
+        # 参考 WorldMem dit.py L269: r_gate_msa（adaLN modulation gate）
+        self.gate = nn.Parameter(torch.zeros(1))
+
+        # 运行时诊断指标（非参数，供外部日志采集）
+        self._last_attn_out_norm: float = 0.0
+        self._last_gate_value: float = 0.0
+
     def forward(
         self,
         x: Tensor,
@@ -99,16 +113,16 @@ class MemoryCrossAttention(nn.Module):
         """
         Args:
             x:             [B, L, dim]  当前帧序列（Query 来源）
-            memory_states: [B, K, dim]  Memory Bank 检索到的历史帧 pose_emb
+            memory_states: [B, K, dim]  Memory Bank 检索到的历史帧嵌入
             memory_lens:   [B]          每个样本实际有效的 memory 帧数（用于 padding mask）
                                         若所有样本 memory 数相同可传 None
 
         Returns:
-            out: [B, L, dim]  memory cross-attention 的输出（残差加法前）
+            out: [B, L, dim]  经 gate 缩放的 memory cross-attention 输出（残差加法前）
         """
-        from wan.modules.attention import flash_attention  # lazy import：仅在 forward 调用时加载 wan
+        from wan.modules.attention import flash_attention  # lazy import
 
-        # dtype 对齐：直接读 Linear weight dtype，避免 next(parameters()) 在 ZeRO-3 下不可靠
+        # dtype 对齐
         target_dtype = self.q.weight.dtype
         if x.dtype != target_dtype:
             x = x.to(target_dtype)
@@ -120,14 +134,21 @@ class MemoryCrossAttention(nn.Module):
             return x.new_zeros(B, L, self.dim)
         K = memory_states.shape[1]
 
-        # Projection + QK-norm（在 view 之前 norm，与 WanCrossAttention 一致）
+        # Projection + QK-norm
         q = self.norm_q(self.q(x)).view(B, L, self.num_heads, self.head_dim)
         k = self.norm_k(self.k(memory_states)).view(B, K, self.num_heads, self.head_dim)
         v = self.v(memory_states).view(B, K, self.num_heads, self.head_dim)
 
         # Flash Attention: [B, L, num_heads, head_dim]
-        out = flash_attention(q, k, v, k_lens=memory_lens)
+        attn_out = flash_attention(q, k, v, k_lens=memory_lens)
 
         # Merge heads: [B, L, dim]
-        out = self.o(out.flatten(2))
-        return out
+        attn_out = self.o(attn_out.flatten(2))
+
+        # 记录诊断指标（detach 避免影响计算图）
+        with torch.no_grad():
+            self._last_attn_out_norm = attn_out.float().norm().item()
+            self._last_gate_value = self.gate.item()
+
+        # Gate 缩放：初始化为 0，训练过程中逐渐打开
+        return self.gate * attn_out

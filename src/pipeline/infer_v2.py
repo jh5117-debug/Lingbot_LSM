@@ -98,11 +98,13 @@ def _parse_args():
 
     # ---- Memory Enhancement 参数（新增）----
     parser.add_argument("--use_memory", action="store_true", default=False,
-                        help="是否启用 Memory Bank（默认 False，保持后向兼容）")
+                        help="Enable Memory Bank for cross-chunk inference")
     parser.add_argument("--memory_max_size", type=int, default=50,
-                        help="Memory Bank 最大容量（默认 50）")
-    parser.add_argument("--num_clips", type=int, default=1,
-                        help="Memory 模式下生成的 clip 数量（默认 1，等价于原行为）")
+                        help="Memory Bank max capacity (default 50)")
+    parser.add_argument("--num_chunks", type=int, default=1,
+                        help="Number of chunks for episode generation (default 1 = no chunking)")
+    parser.add_argument("--memory_top_k", type=int, default=4,
+                        help="Top-K frames to retrieve from Memory Bank")
 
     return parser.parse_args()
 
@@ -288,103 +290,123 @@ def _unpatch_pipeline_memory(pipeline):
         del model._original_forward
 
 
-def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
-                        c2ws_plucker_emb=None, nfp_head=None, last_hidden_states=None):
-    """用当前 clip 的 VAE latent 更新 MemoryBank（surprise-driven）。
+def _compute_chunk_surprises_v2(pipeline, frame_embs, video_latent):
+    """Compute per-frame surprise for a generated chunk.
 
-    问题3修复：pose_emb 优先用 get_projected_frame_embs() 计算模型空间嵌入（dim=5120），
-    与 MemoryCrossAttention 期待的 Key/Value 维度一致；退化时用 latent 均值（dim=16）。
-
-    问题4修复（随问题3一起）：改用投影嵌入后，K/V 具有真正的视觉语义投影特征。
-
-    问题5修复：surprise score 接口新增 nfp_head 参数，当前保留帧间 cosine distance 退化方案。
-    # TODO：完整对齐需在推理时通过 forward hook 捕获 model.blocks[-1] 的 hidden_states，
-    # 传入 nfp_head(hidden_states) 计算真实预测误差；当前用帧间 cosine distance 代理。
-
-    Args:
-        bank:               MemoryBank 实例
-        video:              当前 clip 的视频帧（Tensor 或类 PIL 格式，与 VAE encode 兼容）
-        pipeline:           WanI2V 管道实例（含 vae）
-        device:             目标设备
-        clip_start_frame:   当前 clip 在完整视频序列中的起始帧索引
-        c2ws_plucker_emb:   可选，[1, C, lat_f, lat_h, lat_w]，来自 dit_cond_dict；
-                            提供时用 get_projected_frame_embs() 计算 5120 维 pose_emb（问题3修复）
-        nfp_head:           可选，NFPHead 实例；接口预留，当前退化为 cosine distance（问题5修复）
-        last_hidden_states: 可选，[1, L, 5120]，forward hook 捕获的 model.blocks[-1] 输出；
-                            提供时用 NFPHead 计算 clip-level surprise（M-1 修复）
+    In inference we do not have teacher-forced targets or a training-time batch,
+    but we can still reuse NFPHead's per-frame next-frame objective by feeding a
+    frame-level proxy sequence and comparing against the generated chunk latent.
+    This keeps inference-time write policy aligned with the training objective
+    much better than the previous frame-to-frame latent cosine heuristic.
     """
-    import torch.nn.functional as F
-    from memory_module.memory_bank import MemoryBank
     from memory_module.model_with_memory import WanModelWithMemory
+    from memory_module.nfp_head import NFPHead
 
-    # FIX[B-02]：offload_model=True 时 VAE 可能已在 CPU，需先移回 device
-    vae_device = next(pipeline.vae.model.parameters()).device
-    if vae_device != device:
-        pipeline.vae.model.to(device)
+    model = pipeline.low_noise_model
+    lat_f = frame_embs.shape[0]
+    if lat_f == 0:
+        return []
+
+    if not isinstance(model, WanModelWithMemory):
+        return [1.0] * lat_f
+
+    nfp_head = getattr(model, "nfp_head", None)
+    if nfp_head is None or lat_f == 1:
+        return [1.0] * lat_f
 
     with torch.no_grad():
-        latent = pipeline.vae.encode([video.to(device)])[0]  # [z_dim, lat_f, h, w]
+        # We do not have full training-time hidden states exposed by WanI2V.generate(),
+        # so we use the projected per-frame conditioning embeddings as a frame-level proxy.
+        pred_latent = nfp_head.forward_per_frame(
+            frame_embs.unsqueeze(0).to(next(nfp_head.parameters()).device),
+            lat_f,
+            num_spatial_per_frame=1,
+        )  # [1, lat_f, z_dim]
 
-    lat_f = latent.shape[1]
-    vae_stride_t = pipeline.vae_stride[0]
-
-    # 问题3修复：计算 per-frame pose embedding（5120维，与 MemoryCrossAttention 对齐）
-    model = pipeline.low_noise_model
-    frame_embs = None
-    if c2ws_plucker_emb is not None and isinstance(model, WanModelWithMemory):
-        with torch.no_grad():
-            frame_embs = model.get_projected_frame_embs(
-                c2ws_plucker_emb.to(device)
-            )  # [lat_f, dim=5120]
-
-    # BLOCK-2 修复：16维退化路径与 MemoryCrossAttention Linear(5120,5120) 不兼容，
-    # 必须在此处拦截，避免将 dim=16 的 pose_emb 存入 bank 后在 retrieve() 时 crash。
-    if frame_embs is None:
-        logger.warning(
-            "_update_memory_bank: c2ws_plucker_emb not provided or model is not "
-            "WanModelWithMemory (model=%s); skipping bank update to prevent "
-            "MemoryCrossAttention dim mismatch (expected dim=5120).",
-            type(model).__name__,
+        nfp_loss_dict = NFPHead.compute_loss_per_frame(
+            pred_latent,
+            video_latent.to(pred_latent.device),
+            mse_weight=1.0,
+            cosine_weight=1.0,
         )
-        return
+        per_frame_surprise = (
+            nfp_loss_dict["per_frame_surprise"].detach().float().cpu()
+        )  # [lat_f - 1]
 
-    # M-1 修复：使用 NFPHead 计算 clip-level surprise（若 last_hidden_states 可用）
-    from memory_module.nfp_head import NFPHead as _NFPHead
-    clip_surprise = None
-    if last_hidden_states is not None and hasattr(model, 'nfp_head') and model.nfp_head is not None:
-        with torch.no_grad():
-            _hs = last_hidden_states.to(device).to(
-                next(model.nfp_head.parameters()).dtype
-            )  # [1, L, 5120]
-            _pred = model.nfp_head.forward(_hs)  # [1, z_dim=16]
-            _actual = latent.float()[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, 16] BLOCK-B 修复：最后帧空间均值，与 train_v2_stage1.py:770 一致
-            clip_surprise = _NFPHead.compute_surprise(
-                _pred.float(), _actual
-            ).item()  # scalar
-        logger.info("NFP clip surprise: %.4f", clip_surprise)
+    surprises = per_frame_surprise.tolist()
+    last_surprise = surprises[-1] if surprises else 1.0
+    surprises.append(last_surprise)  # no next-frame target for the last frame
 
+    logger.debug(
+        "NFP proxy surprise: mean=%.4f, max=%.4f, min=%.4f",
+        sum(surprises) / len(surprises), max(surprises), min(surprises),
+    )
+    return surprises
+
+
+def _update_memory_bank_v2(bank, frame_embs, surprises, chunk_id, vae_stride_t=4):
+    """Write frame embeddings + surprise scores into MemoryBank."""
+    lat_f = frame_embs.shape[0]
+    if len(surprises) != lat_f:
+        raise ValueError(
+            f"surprises length mismatch: got {len(surprises)}, expected {lat_f}"
+        )
+
+    bank.increment_age()
     for t in range(lat_f):
-        if clip_surprise is not None:
-            # M-1 修复：使用 NFPHead clip-level surprise（per-clip 粒度对齐训练）
-            surprise = clip_surprise
-        elif t == 0:
-            surprise = 1.0
-        else:
-            prev = latent[:, t - 1].flatten().float()
-            curr = latent[:, t].flatten().float()
-            cos_sim = F.cosine_similarity(prev.unsqueeze(0), curr.unsqueeze(0)).item()
-            surprise = float(1.0 - cos_sim)
-
-        pose_emb = frame_embs[t].cpu()  # [dim=5120]，由 BLOCK-2 保证必为 5120 维
-
         bank.update(
-            pose_emb=pose_emb,
-            latent=latent[:, t].cpu(),
-            surprise_score=surprise,
-            timestep=clip_start_frame + t * vae_stride_t,
+            key_state=frame_embs[t].cpu(),
+            value_visual=frame_embs[t].cpu(),
+            surprise_score=surprises[t],
+            timestep=chunk_id * lat_f * vae_stride_t + t * vae_stride_t,
+            chunk_id=chunk_id,
         )
 
-    logger.info("MemoryBank updated: %s", bank)
+    logger.info("MemoryBank updated (chunk %d): %s", chunk_id, bank)
+    stats = bank.get_stats()
+    for k, v in stats.items():
+        logger.info("  %s: %.4f", k, v)
+
+
+def _write_chunk_action_dir(action_path, frame_offset, chunk_frame_num, tmp_dir):
+    """Write a per-chunk subset of action data to a temp dir.
+
+    WanI2V.generate() re-reads poses.npy/action.npy/intrinsics.npy from
+    action_path on every call, slicing to frame_num. To inject correct
+    per-chunk control, we write the chunk's subset to a temp dir.
+
+    Args:
+        action_path: original action data directory
+        frame_offset: start frame index in the original episode
+        chunk_frame_num: number of frames in this chunk
+        tmp_dir: temporary directory to write to
+
+    Returns:
+        str: path to temp dir with chunk's action data
+    """
+    import numpy as np
+    import shutil
+
+    chunk_dir = os.path.join(tmp_dir, f"chunk_{frame_offset}")
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    # poses.npy: [N, 4, 4]
+    poses_full = np.load(os.path.join(action_path, "poses.npy"))
+    chunk_end = min(frame_offset + chunk_frame_num, len(poses_full))
+    np.save(os.path.join(chunk_dir, "poses.npy"), poses_full[frame_offset:chunk_end])
+
+    # action.npy: [N, action_dim]
+    action_file = os.path.join(action_path, "action.npy")
+    if os.path.exists(action_file):
+        action_full = np.load(action_file)
+        np.save(os.path.join(chunk_dir, "action.npy"), action_full[frame_offset:chunk_end])
+
+    # intrinsics.npy: shared across frames
+    intrinsics_file = os.path.join(action_path, "intrinsics.npy")
+    if os.path.exists(intrinsics_file):
+        shutil.copy2(intrinsics_file, os.path.join(chunk_dir, "intrinsics.npy"))
+
+    return chunk_dir
 
 
 # ---------------------------------------------------------------------------
@@ -448,200 +470,325 @@ def main():
         memory_bank = MemoryBank(max_size=args.memory_max_size)
         logger.info("MemoryBank created: %s", memory_bank)
 
-    # ---- Step 5：加载图像，生成视频 ----
+    # ---- Step 5: Generate video ----
     img = Image.open(args.image).convert("RGB")
     max_area = MAX_AREA_CONFIGS[args.size]
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    if args.use_memory and memory_bank is not None:
+    if args.use_memory and memory_bank is not None and args.num_chunks > 1:
+        # Chunked memory inference (v2 fix: real cross-chunk loop)
         from memory_module.model_with_memory import WanModelWithMemory
+        import numpy as np
+        import tempfile
+        from wan.utils.cam_utils import (
+            compute_relative_poses, interpolate_camera_poses,
+            get_plucker_embeddings, get_Ks_transformed,
+        )
+        from einops import rearrange
+
+        # Load action data
+        if args.action_path is None:
+            logger.error("--action_path is required for chunked memory inference.")
+            return
+
+        c2ws = np.load(os.path.join(args.action_path, "poses.npy"))
+        Ks_raw = torch.from_numpy(
+            np.load(os.path.join(args.action_path, "intrinsics.npy"))
+        ).float()
+        wasd_action = np.load(os.path.join(args.action_path, "action.npy"))
+
+        # Parse resolution
+        h_str, w_str = args.size.split("*")
+        h, w = int(h_str), int(w_str)
+
+        total_frames = min(args.frame_num, ((len(c2ws) - 1) // 4) * 4 + 1)
+        frames_per_chunk = max(5, total_frames // args.num_chunks)
+        # Ensure frames_per_chunk is 4n+1
+        frames_per_chunk = ((frames_per_chunk - 1) // 4) * 4 + 1
+
         all_videos = []
-        current_img = img
+        chunk_id = 0
+        frame_offset = 0
 
-        # BLOCK-1 修复：预加载 action_path 中的 poses/actions/intrinsics，
-        # 构建 c2ws_plucker_emb 传入 _update_memory_bank()，确保问题3修复（5120维 pose_emb）生效。
-        _c2ws_plucker_emb_for_bank = None
-        # M-4 修复：广播 memory_states 初始化（多卡分布式推理时各 rank 保持一致）
-        _broadcast_memory_states = None
-        if args.action_path and os.path.isdir(args.action_path):
-            try:
-                import numpy as _np
-                from pipeline.dataloader import build_dit_cond_dict as _build_dit_cond_dict
-                _poses_np = _np.load(os.path.join(args.action_path, "poses.npy"))
-                _actions_np = _np.load(os.path.join(args.action_path, "action.npy"))
-                _intrinsics_np = _np.load(os.path.join(args.action_path, "intrinsics.npy"))
-                _h, _w = [int(x) for x in args.size.split("*")]
-                _cond = _build_dit_cond_dict(
-                    poses=torch.from_numpy(_poses_np).float(),
-                    actions=torch.from_numpy(_actions_np).float(),
-                    intrinsics=torch.from_numpy(_intrinsics_np).float(),
-                    height=_h,
-                    width=_w,
-                )
-                _c2ws_plucker_emb_for_bank = _cond["c2ws_plucker_emb"][0]
+        # Temp dir for per-chunk action slices
+        tmp_action_root = tempfile.mkdtemp(prefix='lingbot_chunk_')
+
+        try:
+            while frame_offset < total_frames:
+                chunk_end = min(frame_offset + frames_per_chunk, total_frames)
+                chunk_frame_num = chunk_end - frame_offset
+                if chunk_frame_num < 5:
+                    break
+                # Ensure 4n+1
+                chunk_frame_num = ((chunk_frame_num - 1) // 4) * 4 + 1
+                chunk_end = frame_offset + chunk_frame_num
+
                 logger.info(
-                    "Preloaded c2ws_plucker_emb for MemoryBank, shape=%s",
-                    tuple(_c2ws_plucker_emb_for_bank.shape),
+                    "=== Chunk %d: frames %d-%d (%d frames) | bank_size=%d ===",
+                    chunk_id, frame_offset, chunk_end - 1, chunk_frame_num, memory_bank.size(),
                 )
-            except Exception as _e:
-                logger.warning(
-                    "Could not build c2ws_plucker_emb from action_path=%s: %s; "
-                    "MemoryBank updates will be skipped (see BLOCK-1 fix).",
-                    args.action_path, _e,
+
+                # Write per-chunk action data to temp dir
+                # This ensures generate() reads the correct slice, not the full episode
+                chunk_action_dir = _write_chunk_action_dir(
+                    args.action_path, frame_offset, chunk_frame_num, tmp_action_root
                 )
-        else:
-            logger.warning(
-                "action_path is None or not a directory (%s); "
-                "MemoryBank updates will be skipped.", args.action_path,
-            )
 
-        for clip_idx in range(args.num_clips):
-            logger.info("Generating clip %d/%d ...", clip_idx + 1, args.num_clips)
+                # Prepare plucker embedding for this chunk (for memory retrieval/update)
+                chunk_c2ws = c2ws[frame_offset:chunk_end]
+                chunk_wasd = wasd_action[frame_offset:chunk_end]
 
-            # M-4：如果有广播来的 memory_states，优先使用（多卡一致性）
-            if _broadcast_memory_states is not None:
-                memory_states = _broadcast_memory_states
-                _broadcast_memory_states = None  # 消费后清空
-                logger.info("Clip %d: using broadcast memory_states (M-4 fix)", clip_idx + 1)
-            else:
-                # 检索 memory（首 clip 时 bank 为空，memory_states=None）
+                lat_h = round(np.sqrt(max_area * (h/w)) // wan_i2v.vae_stride[1] // wan_i2v.patch_size[1] * wan_i2v.patch_size[1])
+                lat_w = round(np.sqrt(max_area / (h/w)) // wan_i2v.vae_stride[2] // wan_i2v.patch_size[2] * wan_i2v.patch_size[2])
+                lat_f = (chunk_frame_num - 1) // wan_i2v.vae_stride[0] + 1
+
+                Ks = get_Ks_transformed(Ks_raw, 480, 832, h, w, h, w)
+                Ks_single = Ks[0]
+
+                c2ws_infer = interpolate_camera_poses(
+                    src_indices=np.linspace(0, len(chunk_c2ws) - 1, len(chunk_c2ws)),
+                    src_rot_mat=chunk_c2ws[:, :3, :3],
+                    src_trans_vec=chunk_c2ws[:, :3, 3],
+                    tgt_indices=np.linspace(0, len(chunk_c2ws) - 1, lat_f),
+                )
+                c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
+                Ks_repeated = Ks_single.repeat(len(c2ws_infer), 1).to(device)
+                c2ws_infer = c2ws_infer.to(device)
+
+                chunk_wasd_sub = torch.from_numpy(chunk_wasd[::4]).float().to(device)
+                if len(chunk_wasd_sub) > lat_f:
+                    chunk_wasd_sub = chunk_wasd_sub[:lat_f]
+                elif len(chunk_wasd_sub) < lat_f:
+                    pad = chunk_wasd_sub[-1:].repeat(lat_f - len(chunk_wasd_sub), 1)
+                    chunk_wasd_sub = torch.cat([chunk_wasd_sub, pad], dim=0)
+
+                c2ws_plucker_emb = get_plucker_embeddings(
+                    c2ws_infer, Ks_repeated, h, w, only_rays_d=True
+                )
+                c1 = int(h // lat_h)
+                c2 = int(w // lat_w)
+                c2ws_plucker_emb = rearrange(
+                    c2ws_plucker_emb, 'f (h c1) (w c2) c -> (f h w) (c c1 c2)', c1=c1, c2=c2,
+                )
+                c2ws_plucker_emb = c2ws_plucker_emb[None, ...]
+                c2ws_plucker_emb = rearrange(
+                    c2ws_plucker_emb, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w,
+                ).to(torch.bfloat16)
+
+                wasd_tensor = chunk_wasd_sub[:, None, None, :].repeat(1, h, w, 1)
+                wasd_tensor = rearrange(
+                    wasd_tensor, 'f (h c1) (w c2) c -> (f h w) (c c1 c2)', c1=c1, c2=c2,
+                )
+                wasd_tensor = wasd_tensor[None, ...]
+                wasd_tensor = rearrange(
+                    wasd_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w,
+                ).to(torch.bfloat16)
+                c2ws_plucker_emb_full = torch.cat([c2ws_plucker_emb, wasd_tensor], dim=1)
+
+                model = wan_i2v.low_noise_model
+                with torch.no_grad():
+                    chunk_frame_embs = model.get_projected_frame_embs(
+                        c2ws_plucker_emb_full.to(device)
+                    )  # [lat_f, dim]
+
+                # Retrieve from memory bank using real pose embeddings
                 memory_states = None
                 if memory_bank.size() > 0:
-                    # HIGH-1 修复：用 get_projected_frame_embs 计算真实 pose query
-                    model_lnm = wan_i2v.low_noise_model
-                    if isinstance(model_lnm, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
-                        with torch.no_grad():
-                            _qfe = model_lnm.get_projected_frame_embs(
-                                _c2ws_plucker_emb_for_bank.to(device)
-                            )  # [lat_f, dim=5120]
-                        query_emb = _qfe[0].to(device)  # [5120]，当前 clip 第一帧 pose emb
-                    else:
-                        query_dim = memory_bank.frames[0].pose_emb.shape[0]
-                        query_emb = torch.zeros(query_dim, device=device)
-                        logger.warning("Clip %d: falling back to zero query (no pose data)", clip_idx + 1)
-                    retrieved = memory_bank.retrieve(query_emb, top_k=4, device=device)
+                    # Use first frame as query
+                    query_emb = chunk_frame_embs[0]  # [dim]
+
+                    retrieved = memory_bank.retrieve(
+                        query_emb, top_k=args.memory_top_k, device=device
+                    )
                     if retrieved is not None:
-                        memory_states = retrieved.unsqueeze(0)  # [1, K, dim]
-                        logger.info("Clip %d: retrieved %d memory frames.", clip_idx + 1, retrieved.shape[0])
+                        memory_states = retrieved["value_visuals"].unsqueeze(0)  # [1, K, dim]
+                        logger.info(
+                            "Retrieved %d frames, sim_mean=%.4f",
+                            memory_states.shape[1],
+                            retrieved["similarities"].mean().item(),
+                        )
 
-            # M-1 修复：注册 forward hook 捕获 model.blocks[-1] hidden_states（供 NFPHead 使用）
-            _nfp_captured_hs = {}
-            _nfp_hook_handle = None
-            _model_lnm = wan_i2v.low_noise_model
-            if isinstance(_model_lnm, WanModelWithMemory):
-                def _nfp_capture_hook(module, inp, out):
-                    hs = out[0] if isinstance(out, (tuple, list)) else out
-                    _nfp_captured_hs['hs'] = hs.detach().cpu()
-                _nfp_hook_handle = _model_lnm.blocks[-1].register_forward_hook(_nfp_capture_hook)
+                # Inject memory and generate
+                # Use chunk_action_dir so generate() reads the CORRECT chunk's control
+                _patch_pipeline_memory(wan_i2v, memory_states)
+                try:
+                    video = wan_i2v.generate(
+                        args.prompt,
+                        img,
+                        action_path=chunk_action_dir,  # per-chunk action data
+                        max_area=max_area,
+                        frame_num=chunk_frame_num,
+                        shift=args.sample_shift,
+                        sample_solver="unipc",
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.guide_scale,
+                        seed=42 + chunk_id,
+                        offload_model=False,
+                    )
+                finally:
+                    _unpatch_pipeline_memory(wan_i2v)
 
-            # 注入 memory_states 并生成
-            _patch_pipeline_memory(wan_i2v, memory_states)
-            try:
-                video = wan_i2v.generate(
-                    args.prompt,
-                    current_img,
-                    action_path=args.action_path,
-                    max_area=max_area,
-                    frame_num=args.frame_num,
-                    shift=args.sample_shift,
-                    sample_solver="unipc",
-                    sampling_steps=args.sample_steps,
-                    guide_scale=args.guide_scale,
-                    seed=42 + clip_idx,
-                    offload_model=False,
-                )
-            finally:
-                _unpatch_pipeline_memory(wan_i2v)
-                # M-1 修复：移除 forward hook
-                if _nfp_hook_handle is not None:
-                    _nfp_hook_handle.remove()
-                    _nfp_hook_handle = None
-            _last_hs_for_nfp = _nfp_captured_hs.pop('hs', None)
+                # --- Multi-GPU state sync ---
+                # WanI2V.generate() only returns decoded video on rank 0.
+                # Rank 0 computes the chunk update payload, then broadcasts the
+                # next-step state so every rank keeps an identical bank/img view.
+                sync_payload = [None]
+                if rank == 0:
+                    if video is None:
+                        raise RuntimeError(
+                            "Rank 0 did not receive generated video from WanI2V.generate()."
+                        )
 
-            if rank == 0 and video is not None:
-                # HIGH-3 修复：确保存入 all_videos 的是 torch.Tensor
-                import numpy as _np_h3
-                _video_tensor = torch.from_numpy(video.copy()) if isinstance(video, _np_h3.ndarray) else video
-                all_videos.append(_video_tensor)
-                # 更新 Memory Bank（BLOCK-1 修复：传入 c2ws_plucker_emb）
-                _update_memory_bank(
+                    vae_device = next(wan_i2v.vae.model.parameters()).device
+                    if vae_device != device:
+                        wan_i2v.vae.model.to(device)
+                    with torch.no_grad():
+                        video_latent = wan_i2v.vae.encode([video.to(device)])[0]
+
+                    chunk_surprises = _compute_chunk_surprises_v2(
+                        pipeline=wan_i2v,
+                        frame_embs=chunk_frame_embs,
+                        video_latent=video_latent,
+                    )
+                    sync_payload[0] = {
+                        "surprises": chunk_surprises,
+                        "last_frame": video[:, -1].detach().cpu(),
+                    }
+                    all_videos.append(video)
+
+                if dist.is_initialized():
+                    dist.broadcast_object_list(sync_payload, src=0)
+
+                payload = sync_payload[0]
+                if payload is None:
+                    raise RuntimeError("Failed to synchronize chunk state from rank 0.")
+
+                _update_memory_bank_v2(
                     bank=memory_bank,
-                    video=video,
-                    pipeline=wan_i2v,
-                    device=device,
-                    clip_start_frame=clip_idx * args.frame_num,
-                    c2ws_plucker_emb=_c2ws_plucker_emb_for_bank,
-                    last_hidden_states=_last_hs_for_nfp,
+                    frame_embs=chunk_frame_embs,
+                    surprises=payload["surprises"],
+                    chunk_id=chunk_id,
                 )
-                # 使用最后一帧作为下一 clip 的初始帧
-                # video shape: [C=3, T, H, W]，取最后时间步 [:, -1] → [C, H, W]
-                from PIL import Image as PILImage
-                import numpy as _np_frame
-                last_frame_chw = video[:, -1]  # [C=3, H, W]
-                if hasattr(last_frame_chw, 'cpu'):
-                    last_frame_chw = last_frame_chw.cpu().float().numpy()
-                # CHW → HWC，[-1,1] → [0,255]
-                last_frame_hwc = last_frame_chw.transpose(1, 2, 0)
-                last_frame_np = (last_frame_hwc * 127.5 + 127.5).clip(0, 255).astype(_np_frame.uint8)
-                current_img = PILImage.fromarray(last_frame_np)
-                logger.info("Clip %d: memory bank updated. Size=%d", clip_idx + 1, memory_bank.size())
 
-            # M-4 修复：广播 memory_states 给所有 rank（仅多卡 Ulysses 模式需要）
-            if world_size > 1 and dist.is_initialized():
-                # rank 0 预计算下一 clip 的 memory_states 供广播
-                if rank == 0 and memory_bank.size() > 0:
-                    _m4_model = wan_i2v.low_noise_model
-                    if isinstance(_m4_model, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
-                        with torch.no_grad():
-                            _m4_qfe = _m4_model.get_projected_frame_embs(
-                                _c2ws_plucker_emb_for_bank.to(device)
-                            )
-                        _m4_q = _m4_qfe[0].to(device)
-                        _m4_retrieved = memory_bank.retrieve(_m4_q, top_k=4, device=device)
-                        _m4_states = _m4_retrieved.unsqueeze(0) if _m4_retrieved is not None else None
-                    else:
-                        _m4_states = None
-                else:
-                    _m4_states = None
-                # 广播 memory_states（使用 broadcast_object_list 支持 None 和 Tensor）
-                _m4_bcast = [_m4_states]
-                dist.broadcast_object_list(_m4_bcast, src=0)
-                _broadcast_memory_states = _m4_bcast[0]
-                if _broadcast_memory_states is not None:
-                    _broadcast_memory_states = _broadcast_memory_states.to(device)
+                # Use last frame as first frame for next chunk on every rank.
+                from torchvision.transforms.functional import to_pil_image
+                last_frame = payload["last_frame"].clamp(-1, 1)
+                img = to_pil_image((last_frame + 1) / 2)
+
+                chunk_id += 1
+                frame_offset = chunk_end
+
+        finally:
+            # Clean up temp action dirs
+            import shutil
+            shutil.rmtree(tmp_action_root, ignore_errors=True)
+
+        # Concatenate all chunks
+        if rank == 0 and all_videos:
+            video = torch.cat(all_videos, dim=1)  # [C, total_F, H, W]
+            logger.info("Chunked episode complete: %d chunks, %d total frames",
+                        chunk_id, video.shape[1])
+
+    elif args.use_memory and memory_bank is not None:
+        # Single-chunk memory inference with real pose query
+        from memory_module.model_with_memory import WanModelWithMemory
+
+        memory_states = None
+        if memory_bank.size() > 0:
+            # Build real pose query from action_path if available
+            model = wan_i2v.low_noise_model
+            if args.action_path is not None and isinstance(model, WanModelWithMemory):
+                import numpy as np
+                from wan.utils.cam_utils import (
+                    compute_relative_poses, interpolate_camera_poses,
+                    get_plucker_embeddings, get_Ks_transformed,
+                )
+                from einops import rearrange
+
+                h_str, w_str = args.size.split("*")
+                h_val, w_val = int(h_str), int(w_str)
+                sc2ws = np.load(os.path.join(args.action_path, "poses.npy"))
+                sKs_raw = torch.from_numpy(
+                    np.load(os.path.join(args.action_path, "intrinsics.npy"))
+                ).float()
+                s_frame_num = min(args.frame_num, ((len(sc2ws) - 1) // 4) * 4 + 1)
+                sc2ws = sc2ws[:s_frame_num]
+                s_lat_f = (s_frame_num - 1) // wan_i2v.vae_stride[0] + 1
+                s_lat_h = round(np.sqrt(max_area * (h_val/w_val)) // wan_i2v.vae_stride[1] // wan_i2v.patch_size[1] * wan_i2v.patch_size[1])
+                s_lat_w = round(np.sqrt(max_area / (h_val/w_val)) // wan_i2v.vae_stride[2] // wan_i2v.patch_size[2] * wan_i2v.patch_size[2])
+
+                sKs = get_Ks_transformed(sKs_raw, 480, 832, h_val, w_val, h_val, w_val)
+                sc2ws_infer = interpolate_camera_poses(
+                    np.linspace(0, len(sc2ws)-1, len(sc2ws)),
+                    sc2ws[:, :3, :3], sc2ws[:, :3, 3],
+                    np.linspace(0, len(sc2ws)-1, s_lat_f),
+                )
+                sc2ws_infer = compute_relative_poses(sc2ws_infer, framewise=True)
+                s_Ks_rep = sKs[0].repeat(len(sc2ws_infer), 1).to(device)
+                sc2ws_infer = sc2ws_infer.to(device)
+
+                s_plucker = get_plucker_embeddings(sc2ws_infer, s_Ks_rep, h_val, w_val, only_rays_d=True)
+                sc1, sc2 = int(h_val // s_lat_h), int(w_val // s_lat_w)
+                s_plucker = rearrange(s_plucker, 'f (h c1) (w c2) c -> (f h w) (c c1 c2)', c1=sc1, c2=sc2)
+                s_plucker = rearrange(s_plucker[None], 'b (f h w) c -> b c f h w', f=s_lat_f, h=s_lat_h, w=s_lat_w).to(torch.bfloat16)
+
+                s_wasd = np.load(os.path.join(args.action_path, "action.npy"))[:s_frame_num]
+                s_wasd_sub = torch.from_numpy(s_wasd[::4]).float().to(device)[:s_lat_f]
+                if len(s_wasd_sub) < s_lat_f:
+                    s_wasd_sub = torch.cat([s_wasd_sub, s_wasd_sub[-1:].repeat(s_lat_f - len(s_wasd_sub), 1)])
+                s_wasd_t = rearrange(
+                    s_wasd_sub[:, None, None, :].repeat(1, h_val, w_val, 1),
+                    'f (h c1) (w c2) c -> (f h w) (c c1 c2)', c1=sc1, c2=sc2
+                )
+                s_wasd_t = rearrange(s_wasd_t[None], 'b (f h w) c -> b c f h w', f=s_lat_f, h=s_lat_h, w=s_lat_w).to(torch.bfloat16)
+                s_plucker_full = torch.cat([s_plucker, s_wasd_t], dim=1)
+
+                with torch.no_grad():
+                    query_emb = model.get_projected_frame_embs(
+                        s_plucker_full.to(device)
+                    )[0]  # First frame as query [dim]
             else:
-                _broadcast_memory_states = None
+                # Fallback: zero query (no action_path)
+                query_emb = torch.zeros(model.dim, device=device)
+                logger.warning("No action_path for single-chunk, using zero query (degenerate).")
 
-        # 拼接所有 clips
-        video = torch.cat(all_videos, dim=1) if all_videos else None  # BLOCK-A 修复：沿时间维度 T(dim=1) 拼接，[C, T*N, H, W]
+            retrieved = memory_bank.retrieve(query_emb, top_k=args.memory_top_k, device=device)
+            if retrieved is not None:
+                memory_states = retrieved["value_visuals"].unsqueeze(0)
+                logger.info("Retrieved %d memory frames, sim_mean=%.4f",
+                            memory_states.shape[1], retrieved["similarities"].mean().item())
+
+        _patch_pipeline_memory(wan_i2v, memory_states)
+        try:
+            video = wan_i2v.generate(
+                args.prompt, img,
+                action_path=args.action_path, max_area=max_area,
+                frame_num=args.frame_num, shift=args.sample_shift,
+                sample_solver="unipc", sampling_steps=args.sample_steps,
+                guide_scale=args.guide_scale, seed=42, offload_model=False,
+            )
+        finally:
+            _unpatch_pipeline_memory(wan_i2v)
 
     else:
-        # 无 memory 路径：与 inference_csgo.py 完全一致
+        # No memory: identical to inference_csgo.py
         video = wan_i2v.generate(
-            args.prompt,
-            img,
-            action_path=args.action_path,
-            max_area=max_area,
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver="unipc",
-            sampling_steps=args.sample_steps,
-            guide_scale=args.guide_scale,
-            seed=42,
-            offload_model=False,
+            args.prompt, img,
+            action_path=args.action_path, max_area=max_area,
+            frame_num=args.frame_num, shift=args.sample_shift,
+            sample_solver="unipc", sampling_steps=args.sample_steps,
+            guide_scale=args.guide_scale, seed=42, offload_model=False,
         )
 
-    # ---- Step 6：保存输出（与 inference_csgo.py 完全一致）----
+    # ---- Step 6: Save output ----
     if rank == 0 and video is not None:
         save_video(
             tensor=video[None],
             save_file=args.save_file,
             fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1),
+            nrow=1, normalize=True, value_range=(-1, 1),
         )
-        logger.info("Saved video → %s", args.save_file)
+        logger.info("Saved video -> %s", args.save_file)
 
     if dist.is_initialized():
         dist.barrier()

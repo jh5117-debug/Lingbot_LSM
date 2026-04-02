@@ -59,8 +59,12 @@ class MemoryBlockWrapper(nn.Module):
     Forward 流程：
         1. block(x, **kwargs)          原始 Self-Attn + Camera FiLM + Text Cross-Attn + FFN
         2. memory_norm(x)              LayerNorm
-        3. memory_cross_attn(x, M)     Memory Cross-Attention（Query=x，KV=memory_states M）
+        3. memory_cross_attn(x, M)     Memory Cross-Attention（含 zero-init gate）
         4. x = x + output              残差连接
+
+    gate 已内化到 MemoryCrossAttention 中（nn.Parameter(torch.zeros(1))），
+    初始化时 memory 分支输出为零，不破坏预训练权重。
+    参考 WorldMem dit.py L304: x = x + gate(r_attn(...), r_gate_msa)
 
     当 dit_cond_dict 中不含 'memory_states' 时，跳过步骤 2-4，行为与原始 block 完全一致。
 
@@ -82,6 +86,7 @@ class MemoryBlockWrapper(nn.Module):
     ):
         super().__init__()
         self.block = block
+        self.dim = dim
         self.memory_norm = WanLayerNorm(dim, eps)
         self.memory_cross_attn = MemoryCrossAttention(
             dim=dim, num_heads=num_heads, qk_norm=qk_norm, eps=eps
@@ -104,6 +109,12 @@ class MemoryBlockWrapper(nn.Module):
         dit_cond_dict = kwargs.get("dit_cond_dict", None)
         if dit_cond_dict is not None and _MEMORY_STATES_KEY in dit_cond_dict:
             memory_states = dit_cond_dict[_MEMORY_STATES_KEY]  # [B, K, dim]
+            assert memory_states.shape[-1] == self.dim, (
+                f"memory_states dim mismatch: got {memory_states.shape[-1]}, "
+                f"expected {self.dim}. Use get_projected_frame_embs() to produce "
+                f"model-space embeddings."
+            )
+            # gate 已内化到 MemoryCrossAttention.forward() 中
             x = x + self.memory_cross_attn(self.memory_norm(x), memory_states)
 
         return x
@@ -202,6 +213,11 @@ class WanModelWithMemory(WanModel):
             与 WanModel.forward 相同：List[Tensor]，每项 [C_out, F, H/8, W/8]
         """
         if memory_states is not None:
+            assert memory_states.shape[-1] == self.dim, (
+                f"memory_states last dim must be {self.dim}, "
+                f"got {memory_states.shape[-1]}. "
+                f"Use get_projected_frame_embs() for model-space embeddings."
+            )
             # 注入到 dit_cond_dict，MemoryBlockWrapper 会从中取出
             dit_cond_dict = dict(dit_cond_dict) if dit_cond_dict is not None else {}
             dit_cond_dict[_MEMORY_STATES_KEY] = memory_states
@@ -284,7 +300,7 @@ class WanModelWithMemory(WanModel):
         # so we read them directly from instance attributes instead.
         model = cls(
             model_type=cfg['model_type'],
-            control_type=cfg.get('control_type', 'cam'),
+            control_type=getattr(base_model, 'control_type', cfg.get('control_type', 'cam')),
             patch_size=base_model.patch_size,
             text_len=cfg['text_len'],
             in_dim=cfg['in_dim'],

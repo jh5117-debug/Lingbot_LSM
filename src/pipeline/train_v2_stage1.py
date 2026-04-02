@@ -326,18 +326,6 @@ def freeze_for_stage(model: nn.Module, stage: int, lora_rank: int) -> list:
         # 解冻 NFPHead
         model.nfp_head.requires_grad_(True)
 
-        # M-3 修复：LoRA 模式下额外解冻 LoRA adapter（lora_A/lora_B）
-        # 避免 setup_lora() 注入的 adapter 被 model.requires_grad_(False) 误冻结
-        if lora_rank > 0:
-            n_lora_params = 0
-            for name, param in model.named_parameters():
-                if 'lora_A' in name or 'lora_B' in name:
-                    param.requires_grad_(True)
-                    n_lora_params += 1
-            logging.info(
-                f"Stage1 LoRA: 额外解冻 {n_lora_params} 个 LoRA adapter 参数（lora_A/lora_B）"
-            )
-
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         trainable_count = sum(p.numel() for p in trainable_params)
         total_count = sum(p.numel() for p in model.parameters())
@@ -666,15 +654,18 @@ class LingBotMemoryTrainer:
         model: nn.Module,
         batch: dict,
         nfp_loss_weight: float = 0.1,
+        enable_memory_training: bool = True,
+        memory_source_ratio: float = 0.5,
     ) -> torch.Tensor:
-        """Single training step with Flow Matching loss + NFP Loss.
+        """Single training step with Flow Matching loss + NFP Loss (v2).
 
-        在 v2 training_step 基础上：
-          1. memory_states=None（训练时不注入 memory bank）
-          2. 增加 NFP loss（forward hook 注册在 model.blocks[-1]）
+        v2 changes vs original:
+          1. Teacher-forced memory: use first half of frames' pose embeddings
+             as memory_states, so memory_cross_attn gets real gradient flow
+          2. Per-frame NFP loss: predict next-frame latent per time step
           3. total_loss = diffusion_loss + nfp_loss_weight * nfp_loss['total']
 
-        NFP Loss hook 注册位置：model.blocks[-1]（最后一个 DiT block）
+        NFP Loss hook: model.blocks[-1] (last DiT block)
         """
         from memory_module.nfp_head import NFPHead
 
@@ -693,6 +684,7 @@ class LingBotMemoryTrainer:
             video_latent.shape[1], video_latent.shape[2], video_latent.shape[3]
         )
         seq_len = lat_f * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+        num_spatial_per_frame = (lat_h * lat_w) // (self.patch_size[1] * self.patch_size[2])
 
         with torch.no_grad():
             context = self.encode_text(prompt)
@@ -702,29 +694,55 @@ class LingBotMemoryTrainer:
             poses, actions, intrinsics, h, w, lat_f, lat_h, lat_w
         )
 
-        # Sample timestep from shifted schedule（与 v2 完全对齐）
+        # ----------------------------------------------------------------
+        # Teacher-Forced Memory (v2 core fix)
+        # Use first half of frames' projected pose embeddings as memory_states
+        # so memory_cross_attn participates in the compute graph.
+        # ----------------------------------------------------------------
+        memory_states = None
+        if enable_memory_training and dit_cond_dict is not None:
+            c2ws_plucker_emb_chunks = dit_cond_dict.get("c2ws_plucker_emb", None)
+            if c2ws_plucker_emb_chunks is not None:
+                # c2ws_plucker_emb is chunked: list of [1, C, lat_f, lat_h, lat_w]
+                c2ws_plucker_emb_full = torch.cat(c2ws_plucker_emb_chunks, dim=0)
+                # get_projected_frame_embs: [lat_f, dim]
+                with torch.no_grad():
+                    frame_embs = model.get_projected_frame_embs(
+                        c2ws_plucker_emb_full.to(self.device)
+                    )  # [lat_f, dim]
+
+                # Split: first memory_source_ratio frames as memory source
+                split_idx = max(1, int(lat_f * memory_source_ratio))
+                memory_source_embs = frame_embs[:split_idx]  # [split_idx, dim]
+
+                # memory_states: [1, K, dim] (K = split_idx)
+                memory_states = memory_source_embs.unsqueeze(0)  # [1, K, dim]
+                logger.debug(
+                    "Teacher-forced memory: %d source frames -> memory_states [1, %d, %d]",
+                    split_idx, memory_states.shape[1], memory_states.shape[2],
+                )
+
+        # Sample timestep from shifted schedule
         sigma, t, training_weight = self.schedule.sample_timestep()
         t = t.to(self.device).unsqueeze(0)
 
-        # Flow Matching: add noise（与 v2 完全对齐）
+        # Flow Matching: add noise
         noise = torch.randn_like(video_latent)
         noisy_latent = (1.0 - sigma) * video_latent + sigma * noise
 
-        # Target: velocity = noise - clean（与 v2 完全对齐）
+        # Target: velocity = noise - clean
         target = noise - video_latent
 
         noisy_latent = noisy_latent.requires_grad_(True)
 
         # ----------------------------------------------------------------
-        # NFP Loss：forward hook 注册在 model.blocks[-1]
-        # 捕获 hidden_states [B, L, dim] → nfp_head.forward → pred_latent
+        # NFP Loss: forward hook on model.blocks[-1]
+        # Capture hidden_states [B, L, dim] for per-frame NFP prediction
         # ----------------------------------------------------------------
-        # 找到最后一个 block（可能是 MemoryBlockWrapper 或原始 WanAttentionBlock）
         last_block = model.blocks[-1]
         captured_hidden_states = {}
 
         def _nfp_hook(module, input, output):
-            # output 是 [B, L, dim] tensor（WanAttentionBlock 返回 tensor）
             if isinstance(output, torch.Tensor):
                 captured_hidden_states["hs"] = output
             elif isinstance(output, (list, tuple)):
@@ -733,15 +751,8 @@ class LingBotMemoryTrainer:
         hook_handle = last_block.register_forward_hook(_nfp_hook)
 
         try:
-            # Forward（训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度）
+            # Forward with teacher-forced memory_states
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                # Stage1 训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度
-                # shape: [B=1, K=1, dim=model.dim]，零初始化，与推理时真实 memory 接口相同
-                dummy_memory = torch.zeros(
-                    1, 1, model.dim,
-                    device=noisy_latent.device,
-                    dtype=torch.bfloat16,
-                )
                 pred = model(
                     [noisy_latent],
                     t=t,
@@ -749,40 +760,53 @@ class LingBotMemoryTrainer:
                     seq_len=seq_len,
                     y=[y],
                     dit_cond_dict=dit_cond_dict,
-                    memory_states=dummy_memory,  # Stage1：dummy zero memory，激活 MemoryCrossAttention 梯度路径
+                    memory_states=memory_states,
                 )[0]
 
-            # Diffusion loss（与 v2 完全对齐：排除第一帧）
+            # Diffusion loss (exclude first frame, aligned with v2)
             pred_rest = pred[:, 1:]
             target_rest = target[:, 1:]
             diffusion_loss = F.mse_loss(pred_rest.float(), target_rest.float())
             diffusion_loss = diffusion_loss * training_weight
 
-            # NFP Loss（Memory Enhancement 新增）
+            # NFP Loss: per-frame (v2 fix)
+            nfp_loss = torch.tensor(0.0, device=self.device)
+            nfp_mse = torch.tensor(0.0, device=self.device)
+            nfp_cosine = torch.tensor(0.0, device=self.device)
             if "hs" in captured_hidden_states and nfp_loss_weight > 0.0:
                 hidden_states = captured_hidden_states["hs"]  # [B, L, dim]
                 nfp_head = model.nfp_head
-                pred_latent = nfp_head(hidden_states)  # [B, z_dim=16]
 
-                # M-2 修复：用 clip 最后一帧空间均值替代全 clip 全局均值，
-                # 更接近"预测下一帧"的语义（下一帧 ≈ clip 最后一帧的延续）
-                # video_latent shape: [z_dim=16, lat_f, lat_h, lat_w]
-                actual_latent = video_latent[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, z_dim=16] 最后帧
+                # Per-frame prediction
+                pred_latent = nfp_head.forward_per_frame(
+                    hidden_states, lat_f, num_spatial_per_frame
+                )  # [B, lat_f, z_dim]
 
-                nfp_loss_dict = NFPHead.compute_loss(
-                    pred_latent, actual_latent,
+                # Per-frame loss with next-frame target
+                nfp_loss_dict = NFPHead.compute_loss_per_frame(
+                    pred_latent, video_latent,
                     mse_weight=1.0, cosine_weight=1.0,
                 )
                 nfp_loss = nfp_loss_dict['total']
+                nfp_mse = nfp_loss_dict['mse']
+                nfp_cosine = nfp_loss_dict['cosine']
                 total_loss = diffusion_loss + nfp_loss_weight * nfp_loss
             else:
                 total_loss = diffusion_loss
 
         finally:
-            # hook 在 try/finally 中移除（保证异常时也清理）
             hook_handle.remove()
 
-        return total_loss
+        # Return decomposed losses for detailed W&B logging
+        return {
+            'total': total_loss,
+            'diffusion': diffusion_loss.detach(),
+            'nfp_total': nfp_loss.detach(),
+            'nfp_mse': nfp_mse.detach(),
+            'nfp_cosine': nfp_cosine.detach(),
+            'has_memory': memory_states is not None,
+            'memory_k': memory_states.shape[1] if memory_states is not None else 0,
+        }
 
 
 # ============================================================
@@ -888,10 +912,27 @@ def parse_args() -> argparse.Namespace:
                         help="训练阶段：1=只训 memory 模块；2=全参数解冻")
     parser.add_argument("--nfp_loss_weight", type=float, default=0.1,
                         help="NFP loss 权重（L_total = L_diffusion + w * L_nfp）")
-    # PENDING[D-03]: Stage2 DiT 学习率，当前假设从预训练权重开始，设为 1e-5（lr/10）。
-    # D-03 解除后若选择不同起点权重，可能需要调整此默认值。
     parser.add_argument("--lr_dit", type=float, default=1e-5,
                         help="Stage2 DiT 学习率（Stage1 时忽略）")
+    parser.add_argument("--enable_memory_training", action="store_true", default=True,
+                        help="启用 teacher-forced memory 训练（memory_cross_attn gets gradient）")
+    parser.add_argument("--no_memory_training", dest="enable_memory_training", action="store_false",
+                        help="禁用 memory 训练（退回 memory_states=None 模式）")
+    parser.add_argument("--memory_source_ratio", type=float, default=0.5,
+                        help="前 N%% 的帧作为 memory source（0.5 = 前半段）")
+
+    # ---- W&B 参数 ----
+    parser.add_argument("--wandb_project", type=str, default="lingbot-memory",
+                        help="W&B project name")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity (team/user)")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="W&B run name")
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"],
+                        help="W&B mode")
+    parser.add_argument("--log_every_steps", type=int, default=10,
+                        help="Log metrics to W&B every N steps")
 
     return parser.parse_args()
 
@@ -915,24 +956,26 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         logging.info(f"Args: {args}")
 
+    # ---- W&B init (Phase 4) ----
+    wb_logger = None
+    try:
+        from scripts.wandb_utils import WandBLogger
+        wb_logger = WandBLogger(args, accelerator)
+    except Exception as e:
+        logger.warning("W&B init skipped: %s", e)
+
     trainer = LingBotMemoryTrainer(args)
     model = trainer.load_models(accelerator.device)
 
-    # ---- 参数冻结 / LoRA 设置 ----
     if args.lora_rank > 0:
-        # LoRA 模式：先 setup_lora（注入 adapter），再 freeze_for_stage
-        # Stage1 时 LoRA 参数也只在 memory 模块中存在（target_modules 包含 memory_cross_attn）
         model = setup_lora(model, args.lora_rank, args.lora_target_modules)
         trainable_params = freeze_for_stage(model, args.stage, args.lora_rank)
     else:
-        # 全参模式：直接 freeze_for_stage
         trainable_params = freeze_for_stage(model, args.stage, 0)
 
-    # ---- 梯度检查点（与 v2 完全对齐）----
     if args.gradient_checkpointing:
         enable_gradient_checkpointing(model)
 
-    # ---- 数据集（与 v2 完全对齐）----
     dataset = CSGODataset(
         args.dataset_dir, split="train",
         num_frames=args.num_frames, height=args.height, width=args.width,
@@ -944,16 +987,9 @@ def main():
         collate_fn=lambda x: x[0],
     )
 
-    # ---- 优化器（与 v2 对齐，但 Stage1 只优化 memory 模块参数）----
     if args.stage == 2:
-        # PENDING[D-03]: Stage2 起点权重未定。
-        # 当前假设：从 args.resume 指定的 Stage1 checkpoint 恢复（含 memory 模块权重），
-        # DiT 参数使用 lingbot-world 预训练权重，lr_dit 通常为 learning_rate 的 1/10。
-        # D-03 解除后若采用对方 CSGO-DiT 权重作为 Stage2 起点，需要在模型加载处替换 base_model。
-        # 届时修改位置：load_models() 中的 WanModel.from_pretrained 调用处。
         from memory_module.model_with_memory import WanModelWithMemory
 
-        # 区分 memory 模块参数 vs DiT 参数（用于 Stage2 差异化学习率）
         memory_param_ids = set()
         for block in model.blocks:
             if hasattr(block, 'memory_cross_attn'):
@@ -978,7 +1014,6 @@ def main():
             weight_decay=args.weight_decay,
         )
     else:
-        # Stage1：只优化 memory 模块参数（与 AdamW+CosineAnnealingLR 对齐）
         optimizer = torch.optim.AdamW(
             trainable_params,
             lr=args.learning_rate,
@@ -993,82 +1028,118 @@ def main():
         model, optimizer, dataloader, lr_scheduler
     )
 
-    # ---- Resume（code_standards.md §2：必须支持 --resume）----
     if args.resume:
         accelerator.load_state(args.resume)
         logging.info(f"Resumed from checkpoint: {args.resume}")
 
-    # ---- 训练循环 ----
+    # ---- Training loop ----
     global_step = 0
-    for epoch in range(args.num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
+    try:
+        for epoch in range(args.num_epochs):
+            model.train()
+            epoch_loss = 0.0
+            num_batches = 0
 
-        progress = tqdm(
-            dataloader,
-            disable=not accelerator.is_main_process,
-            desc=f"Epoch {epoch+1}/{args.num_epochs} [stage={args.stage}]",
-        )
-
-        for batch in progress:
-            # code_standards.md §2：OOM 防御
-            try:
-                with accelerator.accumulate(model):
-                    loss = trainer.training_step(
-                        accelerator.unwrap_model(model),
-                        batch,
-                        nfp_loss_weight=args.nfp_loss_weight,
-                    )
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        # H-2 修复：使用 accelerator-prepared model.parameters() 替代 pre-prepare 的
-                        # trainable_params 列表，避免 ZeRO-3 下参数指针已迁移导致梯度裁剪静默失效
-                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                logger.warning(
-                    f"OOM at step {global_step}, batch_size=1. "
-                    "Consider reducing num_frames or gradient_accumulation_steps."
-                )
-                raise  # 不静默吞掉（code_standards.md §2）
-
-            epoch_loss += loss.item()
-            num_batches += 1
-            global_step += 1
-            progress.set_postfix(
-                loss=f"{loss.item():.4f}",
-                lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            progress = tqdm(
+                dataloader,
+                disable=not accelerator.is_main_process,
+                desc=f"Epoch {epoch+1}/{args.num_epochs} [stage={args.stage}]",
             )
 
-            # code_standards.md §2：定期保存 checkpoint
-            if args.save_steps and global_step % args.save_steps == 0:
-                save_checkpoint(accelerator, model, args, f"step_{global_step}")
+            for batch in progress:
+                try:
+                    with accelerator.accumulate(model):
+                        loss_result = trainer.training_step(
+                            accelerator.unwrap_model(model),
+                            batch,
+                            nfp_loss_weight=args.nfp_loss_weight,
+                            enable_memory_training=args.enable_memory_training,
+                            memory_source_ratio=args.memory_source_ratio,
+                        )
+                        loss = loss_result['total']
+                        accelerator.backward(loss)
 
-            # dry_run：只跑 2 steps（code_standards.md §2）
-            if args.dry_run and global_step >= 2:
-                logging.info("dry_run=True, stopping after 2 steps.")
+                        # W&B logging BEFORE zero_grad so grad norms are valid
+                        loss_val = loss.item()
+                        if wb_logger is not None:
+                            current_lr = lr_scheduler.get_last_lr()[0]
+                            wb_logger.log_step(
+                                step=global_step + 1,  # +1 because incremented below
+                                loss_dict={
+                                    "loss/total": loss_val,
+                                    "loss/diffusion": loss_result['diffusion'].item(),
+                                    "loss/nfp_total": loss_result['nfp_total'].item(),
+                                    "loss/nfp_mse": loss_result['nfp_mse'].item(),
+                                    "loss/nfp_cosine": loss_result['nfp_cosine'].item(),
+                                    "memory/has_memory": float(loss_result['has_memory']),
+                                    "memory/memory_k": float(loss_result['memory_k']),
+                                },
+                                model=accelerator.unwrap_model(model),
+                                lr=current_lr,
+                            )
+
+                        if accelerator.sync_gradients:
+                            # Clip the prepared model params so gradient clipping still
+                            # works correctly after accelerator/deepspeed parameter wrapping.
+                            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        f"OOM at step {global_step}, batch_size=1. "
+                        "Consider reducing num_frames or gradient_accumulation_steps."
+                    )
+                    raise
+
+                epoch_loss += loss_val
+                num_batches += 1
+                global_step += 1
+
+                current_lr = lr_scheduler.get_last_lr()[0]
+                progress.set_postfix(
+                    loss=f"{loss_val:.4f}",
+                    lr=f"{current_lr:.2e}",
+                )
+
+                if args.save_steps and global_step % args.save_steps == 0:
+                    save_checkpoint(accelerator, model, args, f"step_{global_step}")
+
+                if args.dry_run and global_step >= 2:
+                    logging.info("dry_run=True, stopping after 2 steps.")
+                    break
+
+            avg_loss = epoch_loss / max(num_batches, 1)
+            if accelerator.is_main_process:
+                logging.info(
+                    f"Epoch {epoch+1}/{args.num_epochs} | "
+                    f"avg_loss: {avg_loss:.4f} | "
+                    f"lr: {lr_scheduler.get_last_lr()[0]:.2e} | "
+                    f"stage: {args.stage}"
+                )
+
+            if (epoch + 1) % args.save_every_n_epochs == 0:
+                save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}")
+
+            if args.dry_run:
                 break
 
-        avg_loss = epoch_loss / max(num_batches, 1)
-        if accelerator.is_main_process:
-            # code_standards.md §4：关键步骤 INFO 日志
-            logging.info(
-                f"Epoch {epoch+1}/{args.num_epochs} | "
-                f"avg_loss: {avg_loss:.4f} | "
-                f"lr: {lr_scheduler.get_last_lr()[0]:.2e} | "
-                f"stage: {args.stage}"
-            )
-
-        if (epoch + 1) % args.save_every_n_epochs == 0:
-            save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}")
-
-        if args.dry_run:
-            break
+    except Exception as exc:
+        if wb_logger is not None:
+            # Auto-detect SLURM log path for crash upload
+            slurm_job_id = os.environ.get('SLURM_JOB_ID')
+            slurm_log = None
+            if slurm_job_id:
+                candidate = os.path.join(args.output_dir, f"slurm-{slurm_job_id}.out")
+                if os.path.exists(candidate):
+                    slurm_log = candidate
+            wb_logger.log_crash(exc, log_path=slurm_log)
+        raise
+    finally:
+        if wb_logger is not None:
+            wb_logger.finish()
 
     save_checkpoint(accelerator, model, args, "final")
     if accelerator.is_main_process:

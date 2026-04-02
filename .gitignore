@@ -11,3 +11,6 @@ __pycache__/
 *.ckpt
 *.pth
 *.bin
+
+# Local documents / generated PDFs
+ALL_PDF/
