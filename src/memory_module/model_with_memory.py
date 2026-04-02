@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 # dit_cond_dict 中 memory_states 的 key（避免字符串 typo）
 _MEMORY_STATES_KEY = "memory_states"
+# MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+# dit_cond_dict 中 memory value states 的 key（visual_emb 投影到模型空间，用作 cross-attn V）
+_MEMORY_VALUE_KEY = "__memory_value_states__"
 
 
 # ---------------------------------------------------------------------------
@@ -87,24 +90,31 @@ class MemoryBlockWrapper(nn.Module):
             dim=dim, num_heads=num_heads, qk_norm=qk_norm, eps=eps
         )
 
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
+    # N-01 fix: 将 **kwargs 改为显式参数，确保 torch.checkpoint 以位置参数调用时不崩溃
+    def forward(self, x: Tensor, e, seq_lens, grid_sizes, freqs,
+                context, context_lens, dit_cond_dict=None) -> Tensor:
         """
         Args:
             x:      [B, L, dim]
-            **kwargs: 传递给内部 block 的全部参数
-                      (e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict)
+            e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict:
+                传递给内部 WanAttentionBlock 的参数（与 WanAttentionBlock.forward 签名一致）
 
         Returns:
             x: [B, L, dim]  含记忆注入后的隐藏状态
         """
         # Step 1: 原始 block
-        x = self.block(x, **kwargs)
+        x = self.block(x, e=e, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs,
+                       context=context, context_lens=context_lens, dit_cond_dict=dit_cond_dict)
 
         # Step 2-4: Memory Cross-Attention（仅当 memory_states 存在时）
-        dit_cond_dict = kwargs.get("dit_cond_dict", None)
+        # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        # K = memory_key_states (pose_emb，FOV 路由)，V = memory_value_states (visual_emb，视觉内容)
         if dit_cond_dict is not None and _MEMORY_STATES_KEY in dit_cond_dict:
-            memory_states = dit_cond_dict[_MEMORY_STATES_KEY]  # [B, K, dim]
-            x = x + self.memory_cross_attn(self.memory_norm(x), memory_states)
+            memory_key_states = dit_cond_dict[_MEMORY_STATES_KEY]        # [B, K, dim]，pose_emb
+            memory_value_states = dit_cond_dict.get(_MEMORY_VALUE_KEY)   # [B, K, dim]，visual_emb；可 None
+            x = x + self.memory_cross_attn(
+                self.memory_norm(x), memory_key_states, memory_value_states
+            )
 
         return x
 
@@ -171,10 +181,16 @@ class WanModelWithMemory(WanModel):
         # NFPHead：预测下一帧 latent，用于 Surprise score 计算
         self.nfp_head = NFPHead(dim=self.dim, z_dim=self.out_dim)
 
+        # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        # latent_proj：将 VAE latent 的空间均值（z_dim=16）投影到模型空间（dim=5120），
+        # 作为 cross-attention 的 V（视觉内容嵌入）
+        self.latent_proj = nn.Linear(self.out_dim, self.dim, bias=False)
+
         logger.info(
             "WanModelWithMemory: wrapped %d blocks with MemoryBlockWrapper "
-            "(layers=%s), added NFPHead(dim=%d, z_dim=%d).",
+            "(layers=%s), added NFPHead(dim=%d, z_dim=%d), latent_proj(%d→%d).",
             len(memory_layers), memory_layers, self.dim, self.out_dim,
+            self.out_dim, self.dim,
         )
 
     # ------------------------------------------------------------------
@@ -190,12 +206,18 @@ class WanModelWithMemory(WanModel):
         y=None,
         dit_cond_dict=None,
         memory_states: Optional[Tensor] = None,
+        memory_value_states: Optional[Tensor] = None,  # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
     ):
-        """在原始 WanModel.forward 基础上支持 memory_states 注入。
+        """在原始 WanModel.forward 基础上支持 memory_states 和 memory_value_states 注入。
+
+        MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        新增 memory_value_states 参数，对应 cross-attention 的 V（视觉内容 visual_emb）。
 
         Args:
-            memory_states: [B, K, dim]  Memory Bank 检索到的历史帧 pose_emb。
-                           若为 None，行为与原始 WanModel 完全一致。
+            memory_states:       [B, K, dim]  Memory Bank 检索到的历史帧 pose_emb（K）。
+                                 若为 None，行为与原始 WanModel 完全一致。
+            memory_value_states: [B, K, dim]  Memory Bank 检索到的历史帧 visual_emb（V）。
+                                 若为 None 则 cross-attention 的 V 退化为 pose_emb（向后兼容）。
             其余参数见 WanModel.forward 文档。
 
         Returns:
@@ -205,6 +227,9 @@ class WanModelWithMemory(WanModel):
             # 注入到 dit_cond_dict，MemoryBlockWrapper 会从中取出
             dit_cond_dict = dict(dit_cond_dict) if dit_cond_dict is not None else {}
             dit_cond_dict[_MEMORY_STATES_KEY] = memory_states
+            # MODIFIED: F-03/F5 fix — 同时注入 visual_emb 作为 V
+            if memory_value_states is not None:
+                dit_cond_dict[_MEMORY_VALUE_KEY] = memory_value_states
 
         return super().forward(
             x, t, context, seq_len, y=y, dit_cond_dict=dit_cond_dict
@@ -213,6 +238,27 @@ class WanModelWithMemory(WanModel):
     # ------------------------------------------------------------------
     # 工厂方法：从预训练 WanModel 转换
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 推理辅助：提取 per-frame visual embedding（F-03/F5 新增）
+    # ------------------------------------------------------------------
+
+    def get_projected_latent_emb(self, latent: Tensor) -> Tensor:
+        """将单帧 VAE latent 投影到模型空间，返回 visual embedding。
+
+        MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        用于计算 cross-attention 的 V（视觉内容），与 K（pose_emb）配合使用。
+
+        Args:
+            latent: [z_dim=16, lat_h, lat_w]  单帧 VAE latent（无 batch 维度）
+
+        Returns:
+            visual_emb: [dim=5120]  VAE latent 投影到模型空间的视觉嵌入
+        """
+        # 空间均值池化：[z_dim, lat_h, lat_w] → [z_dim]
+        feat = latent.float().mean(dim=[-2, -1])  # [z_dim=16]
+        # 线性投影：[z_dim=16] → [dim=5120]
+        return self.latent_proj(feat)  # [dim=5120]
 
     # ------------------------------------------------------------------
     # 推理辅助：提取 per-frame pose embedding（用于 MemoryBank 存储与检索）
@@ -326,7 +372,7 @@ class WanModelWithMemory(WanModel):
         if missing:
             logger.info(
                 "from_wan_model: %d keys not in base model "
-                "(expected: memory_cross_attn + nfp_head): %s",
+                "(expected: memory_cross_attn + nfp_head + latent_proj): %s",
                 len(missing), missing[:5],
             )
 

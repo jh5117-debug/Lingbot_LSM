@@ -326,6 +326,12 @@ def freeze_for_stage(model: nn.Module, stage: int, lora_rank: int) -> list:
         # 解冻 NFPHead
         model.nfp_head.requires_grad_(True)
 
+        # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        # 解冻 latent_proj（VAE latent → 模型空间的线性投影，用于生成 visual_emb 作为 cross-attn V）
+        if hasattr(model, 'latent_proj'):
+            model.latent_proj.requires_grad_(True)
+            logging.info("Stage1: 解冻 latent_proj (F-03/F5 fix)")
+
         # M-3 修复：LoRA 模式下额外解冻 LoRA adapter（lora_A/lora_B）
         # 避免 setup_lora() 注入的 adapter 被 model.requires_grad_(False) 误冻结
         if lora_rank > 0:
@@ -733,15 +739,26 @@ class LingBotMemoryTrainer:
         hook_handle = last_block.register_forward_hook(_nfp_hook)
 
         try:
-            # Forward（训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度）
+            # Forward（训练时注入 dummy memory K + 真实 latent 投影 V，确保 MemoryCrossAttention 和 latent_proj 接收梯度）
+            # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+            # latent_proj 需要在训练 forward 中被调用才有梯度路径。
+            # 策略：dummy_memory_k（零初始化）作为 K；用真实 latent 投影的 visual_emb 作为 V。
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                # Stage1 训练时注入 dummy memory，确保 MemoryCrossAttention 接收梯度
-                # shape: [B=1, K=1, dim=model.dim]，零初始化，与推理时真实 memory 接口相同
-                dummy_memory = torch.zeros(
+                # K: dummy zero memory，shape [1, 1, dim=model.dim]
+                dummy_memory_k = torch.zeros(
                     1, 1, model.dim,
                     device=noisy_latent.device,
                     dtype=torch.bfloat16,
                 )
+                # V: 真实 latent 的最后帧空间均值经 latent_proj 投影（确保 latent_proj 有梯度）
+                # MODIFIED: F-03/F5 fix — 不用 no_grad，让 latent_proj 参与反传
+                if hasattr(model, 'latent_proj'):
+                    # video_latent: [z_dim=16, lat_f, lat_h, lat_w]，取最后帧空间均值 [16]
+                    _v_feat = video_latent[:, -1].float().mean(dim=[-2, -1])  # [16]
+                    _v_emb = model.latent_proj(_v_feat)                        # [5120]
+                    dummy_memory_v = _v_emb.unsqueeze(0).unsqueeze(0).to(torch.bfloat16)  # [1, 1, 5120]
+                else:
+                    dummy_memory_v = dummy_memory_k  # 退化路径（latent_proj 未加载）
                 pred = model(
                     [noisy_latent],
                     t=t,
@@ -749,7 +766,8 @@ class LingBotMemoryTrainer:
                     seq_len=seq_len,
                     y=[y],
                     dit_cond_dict=dit_cond_dict,
-                    memory_states=dummy_memory,  # Stage1：dummy zero memory，激活 MemoryCrossAttention 梯度路径
+                    memory_states=dummy_memory_k,       # K: dummy zero memory，激活 MemoryCrossAttention
+                    memory_value_states=dummy_memory_v, # V: 真实 latent 投影，确保 latent_proj 梯度路径
                 )[0]
 
             # Diffusion loss（与 v2 完全对齐：排除第一帧）
@@ -892,6 +910,17 @@ def parse_args() -> argparse.Namespace:
     # D-03 解除后若选择不同起点权重，可能需要调整此默认值。
     parser.add_argument("--lr_dit", type=float, default=1e-5,
                         help="Stage2 DiT 学习率（Stage1 时忽略）")
+    parser.add_argument("--wandb_project", type=str, default="lingbot-memory",
+                        help="W&B project 名称")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="W&B entity/团队名（可选）")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="W&B run 名称（默认自动生成）")
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"],
+                        help="W&B 模式：online/offline/disabled")
+    parser.add_argument("--log_every_steps", type=int, default=10,
+                        help="W&B 日志记录频率（每 N 步记录一次）")
 
     return parser.parse_args()
 
@@ -910,6 +939,17 @@ def main():
     accelerator = accelerate.Accelerator(
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
     )
+
+    # ---- W&B 日志（可选，--wandb_mode=disabled 时跳过）----
+    wb_logger = None
+    if args.wandb_mode != "disabled":
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from scripts.wandb_utils import WandBLogger
+            wb_logger = WandBLogger(args, accelerator)
+        except Exception as _wb_e:
+            logging.warning("W&B init failed (non-fatal, training continues): %s", _wb_e)
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -964,6 +1004,10 @@ def main():
                         memory_param_ids.add(id(p))
         for p in model.nfp_head.parameters():
             memory_param_ids.add(id(p))
+        # N-02 修复：latent_proj 在 model 上直接挂载，不在 blocks 中，需单独收集
+        if hasattr(model, 'latent_proj'):
+            for p in model.latent_proj.parameters():
+                memory_param_ids.add(id(p))
 
         memory_params = [p for p in model.parameters()
                          if p.requires_grad and id(p) in memory_param_ids]
@@ -1000,79 +1044,101 @@ def main():
 
     # ---- 训练循环 ----
     global_step = 0
-    for epoch in range(args.num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
+    try:
+        for epoch in range(args.num_epochs):
+            model.train()
+            epoch_loss = 0.0
+            num_batches = 0
 
-        progress = tqdm(
-            dataloader,
-            disable=not accelerator.is_main_process,
-            desc=f"Epoch {epoch+1}/{args.num_epochs} [stage={args.stage}]",
-        )
-
-        for batch in progress:
-            # code_standards.md §2：OOM 防御
-            try:
-                with accelerator.accumulate(model):
-                    loss = trainer.training_step(
-                        accelerator.unwrap_model(model),
-                        batch,
-                        nfp_loss_weight=args.nfp_loss_weight,
-                    )
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        # H-2 修复：使用 accelerator-prepared model.parameters() 替代 pre-prepare 的
-                        # trainable_params 列表，避免 ZeRO-3 下参数指针已迁移导致梯度裁剪静默失效
-                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                logger.warning(
-                    f"OOM at step {global_step}, batch_size=1. "
-                    "Consider reducing num_frames or gradient_accumulation_steps."
-                )
-                raise  # 不静默吞掉（code_standards.md §2）
-
-            epoch_loss += loss.item()
-            num_batches += 1
-            global_step += 1
-            progress.set_postfix(
-                loss=f"{loss.item():.4f}",
-                lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+            progress = tqdm(
+                dataloader,
+                disable=not accelerator.is_main_process,
+                desc=f"Epoch {epoch+1}/{args.num_epochs} [stage={args.stage}]",
             )
 
-            # code_standards.md §2：定期保存 checkpoint
-            if args.save_steps and global_step % args.save_steps == 0:
-                save_checkpoint(accelerator, model, args, f"step_{global_step}")
+            for batch in progress:
+                # code_standards.md §2：OOM 防御
+                try:
+                    with accelerator.accumulate(model):
+                        loss = trainer.training_step(
+                            accelerator.unwrap_model(model),
+                            batch,
+                            nfp_loss_weight=args.nfp_loss_weight,
+                        )
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            # H-2 修复：使用 accelerator-prepared model.parameters() 替代 pre-prepare 的
+                            # trainable_params 列表，避免 ZeRO-3 下参数指针已迁移导致梯度裁剪静默失效
+                            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
+                        if wb_logger is not None and accelerator.sync_gradients:
+                            _loss_dict = {
+                                "loss/total": loss.item(),
+                                "loss/diffusion": loss.item(),
+                            }
+                            wb_logger.log_step(
+                                global_step + 1,   # +1 因为 global_step 在 accumulate 块外才递增
+                                _loss_dict,
+                                model=accelerator.unwrap_model(model),
+                                lr=lr_scheduler.get_last_lr()[0],
+                            )
+                        optimizer.zero_grad()
 
-            # dry_run：只跑 2 steps（code_standards.md §2）
-            if args.dry_run and global_step >= 2:
-                logging.info("dry_run=True, stopping after 2 steps.")
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        f"OOM at step {global_step}, batch_size=1. "
+                        "Consider reducing num_frames or gradient_accumulation_steps."
+                    )
+                    raise  # 不静默吞掉（code_standards.md §2）
+
+                epoch_loss += loss.item()
+                num_batches += 1
+                global_step += 1
+
+                progress.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                )
+
+                # code_standards.md §2：定期保存 checkpoint
+                if args.save_steps and global_step % args.save_steps == 0:
+                    save_checkpoint(accelerator, model, args, f"step_{global_step}")
+
+                # dry_run：只跑 2 steps（code_standards.md §2）
+                if args.dry_run and global_step >= 2:
+                    logging.info("dry_run=True, stopping after 2 steps.")
+                    break
+
+            avg_loss = epoch_loss / max(num_batches, 1)
+            if accelerator.is_main_process:
+                # code_standards.md §4：关键步骤 INFO 日志
+                logging.info(
+                    f"Epoch {epoch+1}/{args.num_epochs} | "
+                    f"avg_loss: {avg_loss:.4f} | "
+                    f"lr: {lr_scheduler.get_last_lr()[0]:.2e} | "
+                    f"stage: {args.stage}"
+                )
+
+            if (epoch + 1) % args.save_every_n_epochs == 0:
+                save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}")
+
+            if args.dry_run:
                 break
 
-        avg_loss = epoch_loss / max(num_batches, 1)
+        save_checkpoint(accelerator, model, args, "final")
         if accelerator.is_main_process:
-            # code_standards.md §4：关键步骤 INFO 日志
-            logging.info(
-                f"Epoch {epoch+1}/{args.num_epochs} | "
-                f"avg_loss: {avg_loss:.4f} | "
-                f"lr: {lr_scheduler.get_last_lr()[0]:.2e} | "
-                f"stage: {args.stage}"
-            )
-
-        if (epoch + 1) % args.save_every_n_epochs == 0:
-            save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}")
-
-        if args.dry_run:
-            break
-
-    save_checkpoint(accelerator, model, args, "final")
-    if accelerator.is_main_process:
-        logging.info("Training complete!")
+            logging.info("Training complete!")
+    except Exception as _exc:
+        if wb_logger is not None:
+            _slurm_log = f"slurm-{os.environ.get('SLURM_JOB_ID', 'local')}.out"
+            wb_logger.log_crash(_exc, log_path=_slurm_log)
+        raise
+    finally:
+        if wb_logger is not None:
+            wb_logger.finish()
 
 
 if __name__ == "__main__":

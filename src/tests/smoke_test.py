@@ -70,14 +70,21 @@ def test_memory_bank_update_and_retrieve():
         "0.0 surprise frame should not be stored"
 
     # retrieve top-2
+    # MODIFIED: F-03/F5 fix — retrieve() 现在返回 (pose_embs, visual_embs) tuple
     query = torch.randn(dim)
     retrieved = bank.retrieve(query, top_k=2)
     assert retrieved is not None
-    assert retrieved.shape == (2, dim), f"expected (2, {dim}), got {retrieved.shape}"
+    pose_embs, visual_embs = retrieved
+    assert pose_embs.shape == (2, dim), f"expected pose_embs (2, {dim}), got {pose_embs.shape}"
+    assert visual_embs.shape == (2, dim), f"expected visual_embs (2, {dim}), got {visual_embs.shape}"
+    # 无 visual_emb 时 visual_embs 退化为 pose_embs（向后兼容）
+    assert torch.allclose(pose_embs, visual_embs), "without visual_emb, visual_embs should equal pose_embs"
 
     # retrieve 超过 bank 大小时取全部
     retrieved_all = bank.retrieve(query, top_k=10)
-    assert retrieved_all.shape[0] == 4
+    assert retrieved_all is not None
+    pose_all, visual_all = retrieved_all
+    assert pose_all.shape[0] == 4
 
     # clear
     bank.clear()
@@ -531,6 +538,154 @@ def test_all_videos_cat_dim():
 
 
 # ---------------------------------------------------------------------------
+# F-03/F8 — K/V 分离集成测试（CPU）
+# ---------------------------------------------------------------------------
+
+def test_memory_bank_visual_emb_stored_and_retrieved():
+    """验证 visual_emb 存入并正确检索 — K/V 真正分离（visual_emb ≠ pose_emb）。"""
+    bank = MemoryBank(max_size=4)
+    dim = 5120
+    dummy_latent = torch.randn(16, 10, 18)
+
+    # 构造内容不同的 pose_emb 和 visual_emb
+    pose_emb_1 = torch.randn(dim)
+    visual_emb_1 = torch.randn(dim)
+    # 确保两者内容确实不同（极小概率相同，virtually impossible）
+    assert not torch.allclose(pose_emb_1, visual_emb_1), \
+        "pose_emb_1 and visual_emb_1 should differ (test precondition)"
+
+    bank.update(
+        pose_emb=pose_emb_1,
+        latent=dummy_latent,
+        surprise_score=1.0,
+        timestep=0,
+        visual_emb=visual_emb_1,
+    )
+
+    query_emb = torch.randn(dim)
+    result = bank.retrieve(query_emb, top_k=1, device=torch.device('cpu'))
+
+    # 返回应是 tuple，长度 2
+    assert isinstance(result, tuple) and len(result) == 2, \
+        f"retrieve() should return tuple of length 2, got {type(result)}"
+
+    key_embs, val_embs = result
+
+    # shape 验证
+    assert key_embs.shape == torch.Size([1, dim]), \
+        f"key_embs.shape expected [1, {dim}], got {key_embs.shape}"
+    assert val_embs.shape == torch.Size([1, dim]), \
+        f"val_embs.shape expected [1, {dim}], got {val_embs.shape}"
+
+    # K/V 分离验证：visual_emb ≠ pose_emb，两者应不同
+    assert not torch.allclose(key_embs, val_embs), \
+        "key_embs (pose) and val_embs (visual) should differ when visual_emb is provided"
+
+    logger.info("[PASS] test_memory_bank_visual_emb_stored_and_retrieved")
+
+
+def test_memory_bank_retrieve_fallback_when_no_visual_emb():
+    """验证 visual_emb=None 时退化路径：val_embs == key_embs（pose_embs）。"""
+    bank = MemoryBank(max_size=4)
+    dim = 5120
+    dummy_latent = torch.randn(16, 10, 18)
+
+    pose_emb = torch.randn(dim)
+    # 不传 visual_emb（退化路径）
+    bank.update(
+        pose_emb=pose_emb,
+        latent=dummy_latent,
+        surprise_score=1.0,
+        timestep=0,
+    )
+
+    query_emb = torch.randn(dim)
+    result = bank.retrieve(query_emb, top_k=1, device=torch.device('cpu'))
+
+    assert isinstance(result, tuple) and len(result) == 2, \
+        f"retrieve() should return tuple of length 2, got {type(result)}"
+
+    key_embs, val_embs = result
+
+    # 退化路径：val_embs 应等于 key_embs（pose_embs）
+    assert torch.allclose(key_embs, val_embs), \
+        "when visual_emb=None, val_embs should equal key_embs (pose fallback)"
+
+    logger.info("[PASS] test_memory_bank_retrieve_fallback_when_no_visual_emb")
+
+
+def test_memory_bank_retrieve_returns_tuple():
+    """验证 retrieve() 在 bank 非空时返回 tuple，不返回 Tensor（Breaking Change 已生效）。"""
+    bank = MemoryBank(max_size=4)
+    pose_emb = torch.randn(5120)
+    latent = torch.randn(16, 10, 18)
+    bank.update(pose_emb, latent, 0.5, 0)
+
+    result = bank.retrieve(torch.randn(5120), top_k=1, device=torch.device('cpu'))
+
+    assert result is not None, "retrieve() should not return None for non-empty bank"
+    assert isinstance(result, tuple), \
+        f"retrieve() should return tuple, got {type(result)}"
+    assert len(result) == 2, \
+        f"retrieve() tuple should have length 2, got {len(result)}"
+
+    key_embs, val_embs = result
+    assert key_embs.shape == torch.Size([1, 5120]), \
+        f"key_embs.shape expected [1, 5120], got {key_embs.shape}"
+    assert val_embs.shape == torch.Size([1, 5120]), \
+        f"val_embs.shape expected [1, 5120], got {val_embs.shape}"
+
+    logger.info("[PASS] test_memory_bank_retrieve_returns_tuple")
+
+
+def test_memory_cross_attention_forward_signature():
+    """验证 MemoryCrossAttention.forward 接受 memory_key_states 和 memory_value_states 分离参数。"""
+    import inspect
+    from memory_module.memory_attention import MemoryCrossAttention
+
+    sig = inspect.signature(MemoryCrossAttention.forward)
+    params = list(sig.parameters.keys())
+
+    assert 'memory_key_states' in params, \
+        f"MemoryCrossAttention.forward missing 'memory_key_states' param, got {params}"
+    assert 'memory_value_states' in params, \
+        f"MemoryCrossAttention.forward missing 'memory_value_states' param, got {params}"
+
+    # memory_value_states 应有默认值 None（向后兼容）
+    default_val = sig.parameters['memory_value_states'].default
+    assert default_val is None, \
+        f"memory_value_states default should be None (backward-compat), got {default_val}"
+
+    logger.info("[PASS] test_memory_cross_attention_forward_signature")
+
+
+def test_model_with_memory_imports_and_constants():
+    """验证 model_with_memory.py 新增的接口存在（_MEMORY_VALUE_KEY, latent_proj, forward 签名）。"""
+    import inspect
+    from memory_module.model_with_memory import WanModelWithMemory, _MEMORY_STATES_KEY, _MEMORY_VALUE_KEY
+
+    # _MEMORY_VALUE_KEY 是 F-03/F5 新增的常量，应是字符串且与 _MEMORY_STATES_KEY 不同
+    assert isinstance(_MEMORY_VALUE_KEY, str), \
+        f"_MEMORY_VALUE_KEY should be str, got {type(_MEMORY_VALUE_KEY)}"
+    assert _MEMORY_VALUE_KEY != _MEMORY_STATES_KEY, \
+        "_MEMORY_VALUE_KEY should differ from _MEMORY_STATES_KEY"
+
+    # WanModelWithMemory.forward 应接受 memory_value_states 参数
+    sig = inspect.signature(WanModelWithMemory.forward)
+    params = list(sig.parameters.keys())
+    assert 'memory_value_states' in params, \
+        f"WanModelWithMemory.forward missing 'memory_value_states' param, got {params}"
+
+    # latent_proj 应作为类属性（nn.Linear）出现在 __init__ 中
+    # 检查方式：验证 __init__ 源代码中含有 latent_proj
+    init_src = inspect.getsource(WanModelWithMemory.__init__)
+    assert 'latent_proj' in init_src, \
+        "WanModelWithMemory.__init__ should define self.latent_proj"
+
+    logger.info("[PASS] test_model_with_memory_imports_and_constants")
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -562,6 +717,13 @@ def main():
     test_freeze_for_stage_lora_behavior()
     test_video_last_frame_extraction()
     test_all_videos_cat_dim()
+
+    # F-03/F8 — K/V 分离集成测试（CPU）
+    test_memory_bank_visual_emb_stored_and_retrieved()
+    test_memory_bank_retrieve_fallback_when_no_visual_emb()
+    test_memory_bank_retrieve_returns_tuple()
+    test_memory_cross_attention_forward_signature()
+    test_model_with_memory_imports_and_constants()
 
     # CUDA 测试（自动跳过）
     test_memory_cross_attention_shapes()

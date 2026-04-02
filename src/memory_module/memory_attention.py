@@ -18,6 +18,8 @@ import logging
 import os
 import sys
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -90,44 +92,73 @@ class MemoryCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        # Zero-init gate：初始化为 0，训练过程中学习打开
+        # 参考 WorldMem dit.py L304 gate 机制；初始化为 0 保证训练初期 memory 分支无输出
+        self.gate = nn.Parameter(torch.zeros(1))
+
+        # 运行时诊断指标（非参数，供 WandBLogger._collect_memory_diagnostics 采集）
+        self._last_attn_out_norm: float = 0.0
+        self._last_gate_value: float = 0.0
+
     def forward(
         self,
         x: Tensor,
-        memory_states: Tensor,
+        memory_key_states: Tensor,
+        memory_value_states: Optional[Tensor] = None,
         memory_lens: Tensor = None,
     ) -> Tensor:
         """
+        MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
+        签名从 forward(x, memory_states, memory_lens) 改为
+              forward(x, memory_key_states, memory_value_states=None, memory_lens=None)
+
         Args:
-            x:             [B, L, dim]  当前帧序列（Query 来源）
-            memory_states: [B, K, dim]  Memory Bank 检索到的历史帧 pose_emb
-            memory_lens:   [B]          每个样本实际有效的 memory 帧数（用于 padding mask）
-                                        若所有样本 memory 数相同可传 None
+            x:                    [B, L, dim]  当前帧序列（Query 来源）
+            memory_key_states:    [B, K, dim]  Memory Bank 检索到的历史帧 pose_emb（用于投影 K，FOV 路由）
+            memory_value_states:  [B, K, dim]  Memory Bank 检索到的历史帧 visual_emb（用于投影 V，视觉内容）；
+                                               若 None 则退化为 memory_key_states（向后兼容）
+            memory_lens:          [B]          每个样本实际有效的 memory 帧数（用于 padding mask）
+                                               若所有样本 memory 数相同可传 None
 
         Returns:
             out: [B, L, dim]  memory cross-attention 的输出（残差加法前）
         """
         from wan.modules.attention import flash_attention  # lazy import：仅在 forward 调用时加载 wan
 
+        # MODIFIED: F-03/F5 fix — 若 value_states 未提供，退化为 key_states（向后兼容）
+        if memory_value_states is None:
+            memory_value_states = memory_key_states
+
         # dtype 对齐：直接读 Linear weight dtype，避免 next(parameters()) 在 ZeRO-3 下不可靠
         target_dtype = self.q.weight.dtype
         if x.dtype != target_dtype:
             x = x.to(target_dtype)
-        if memory_states is not None and memory_states.dtype != target_dtype:
-            memory_states = memory_states.to(target_dtype)
+        if memory_key_states is not None and memory_key_states.dtype != target_dtype:
+            memory_key_states = memory_key_states.to(target_dtype)
+        if memory_value_states is not None and memory_value_states.dtype != target_dtype:
+            memory_value_states = memory_value_states.to(target_dtype)
 
         B, L, _ = x.shape
-        if memory_states is None:
+        if memory_key_states is None:
             return x.new_zeros(B, L, self.dim)
-        K = memory_states.shape[1]
+        K = memory_key_states.shape[1]
 
         # Projection + QK-norm（在 view 之前 norm，与 WanCrossAttention 一致）
+        # K 来自 pose_embs（FOV 路由），V 来自 visual_embs（视觉内容）
+        # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
         q = self.norm_q(self.q(x)).view(B, L, self.num_heads, self.head_dim)
-        k = self.norm_k(self.k(memory_states)).view(B, K, self.num_heads, self.head_dim)
-        v = self.v(memory_states).view(B, K, self.num_heads, self.head_dim)
+        k = self.norm_k(self.k(memory_key_states)).view(B, K, self.num_heads, self.head_dim)
+        v = self.v(memory_value_states).view(B, K, self.num_heads, self.head_dim)
 
         # Flash Attention: [B, L, num_heads, head_dim]
         out = flash_attention(q, k, v, k_lens=memory_lens)
 
         # Merge heads: [B, L, dim]
         out = self.o(out.flatten(2))
-        return out
+
+        # 记录诊断指标（detach 避免影响计算图）
+        with torch.no_grad():
+            self._last_attn_out_norm = out.float().norm().item()
+            self._last_gate_value = self.gate.item()
+        # Gate 缩放：初始化为 0，训练过程中逐渐打开
+        return self.gate * out
