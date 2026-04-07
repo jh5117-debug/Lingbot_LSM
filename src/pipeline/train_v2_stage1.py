@@ -771,9 +771,12 @@ class LingBotMemoryTrainer:
                 )[0]
 
             # Diffusion loss（与 v2 完全对齐：排除第一帧）
+            # Keep pred_rest in its native bf16 dtype (from autocast model forward) so
+            # the autograd graph stays in bf16, satisfying DeepSpeed bf16 engine backward.
+            # target_rest has no requires_grad so casting it is safe.
             pred_rest = pred[:, 1:]
             target_rest = target[:, 1:]
-            diffusion_loss = F.mse_loss(pred_rest.float(), target_rest.float())
+            diffusion_loss = F.mse_loss(pred_rest, target_rest.to(pred_rest.dtype))
             diffusion_loss = diffusion_loss * training_weight
 
             # NFP Loss（Memory Enhancement 新增）
@@ -785,7 +788,8 @@ class LingBotMemoryTrainer:
                 # M-2 修复：用 clip 最后一帧空间均值替代全 clip 全局均值，
                 # 更接近"预测下一帧"的语义（下一帧 ≈ clip 最后一帧的延续）
                 # video_latent shape: [z_dim=16, lat_f, lat_h, lat_w]
-                actual_latent = video_latent[:, -1].mean(dim=[-2, -1]).unsqueeze(0)  # [1, z_dim=16] 最后帧
+                # Cast to pred_latent dtype (bf16) to match autograd graph dtype.
+                actual_latent = video_latent[:, -1].mean(dim=[-2, -1]).unsqueeze(0).to(pred_latent.dtype)  # [1, z_dim=16]
 
                 nfp_loss_dict = NFPHead.compute_loss(
                     pred_latent, actual_latent,
@@ -800,9 +804,7 @@ class LingBotMemoryTrainer:
             # hook 在 try/finally 中移除（保证异常时也清理）
             hook_handle.remove()
 
-        # Cast back to bf16: DeepSpeed bf16 engine requires loss in bfloat16;
-        # diffusion_loss was computed in float32 via .float() for numerical stability.
-        return total_loss.to(torch.bfloat16)
+        return total_loss
 
 
 # ============================================================
