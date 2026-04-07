@@ -33,6 +33,9 @@ CUDA_VISIBLE_DEVICES="4,5,6,7"  # 使用哪几张 GPU，例如 "0"、"0,1"、"0,
 # ============================================================
 
 export CUDA_VISIBLE_DEVICES
+# Allow the CUDA allocator to use non-contiguous reserved memory, reducing OOM from
+# fragmentation during gradient checkpointing recomputation (rope_apply float32 spike).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l | xargs)
 
 # ---------- 路径检查 ----------
