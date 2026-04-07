@@ -800,7 +800,9 @@ class LingBotMemoryTrainer:
             # hook 在 try/finally 中移除（保证异常时也清理）
             hook_handle.remove()
 
-        return total_loss
+        # Cast back to bf16: DeepSpeed bf16 engine requires loss in bfloat16;
+        # diffusion_loss was computed in float32 via .float() for numerical stability.
+        return total_loss.to(torch.bfloat16)
 
 
 # ============================================================
