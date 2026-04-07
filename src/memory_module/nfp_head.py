@@ -75,6 +75,8 @@ class NFPHead(nn.Module):
         """
         # Mean-pool over sequence length → [B, dim]
         x = hidden_states.mean(dim=1)
+        # Ensure dtype matches MLP weights (e.g. bfloat16 vs float32)
+        x = x.to(self.mlp[0].weight.dtype)
         # MLP → [B, z_dim]
         return self.mlp(x)
 
