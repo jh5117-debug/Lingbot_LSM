@@ -23,7 +23,7 @@ set -e
 # Step 0 — 环境名称变量
 # =============================================================================
 ENV_NAME="lingbot-lsm"
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.10"
 TORCH_CUDA_TAG="cu124"   # 可改为 cu121 / cu118
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
