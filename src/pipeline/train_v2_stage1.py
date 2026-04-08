@@ -457,6 +457,9 @@ class LingBotMemoryTrainer:
             boundary=0.947,
         )
 
+        # T5 prompt cache：避免重复编码同一 prompt（per-prompt, stored on CPU）
+        self._t5_cache: dict = {}
+
         # cam_utils 在 load_models 后可用
         self.cam_utils = {}
 
@@ -538,13 +541,16 @@ class LingBotMemoryTrainer:
     def encode_text(self, prompt: str) -> list:
         """prompt string -> list of text embedding tensors
 
-        与 v2 完全对齐。
+        与 v2 完全对齐；新增 CPU cache 避免重复编码。
         """
+        if prompt in self._t5_cache:
+            return [t.to(self.device) for t in self._t5_cache[prompt]]
         self.t5.model.to(self.device)
         context = self.t5([prompt], self.device)
         self.t5.model.cpu()
         torch.cuda.empty_cache()
-        return [t.to(self.device) for t in context]
+        self._t5_cache[prompt] = [t.cpu() for t in context]
+        return [t.to(self.device) for t in self._t5_cache[prompt]]
 
     def prepare_y(self, video_tensor: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
         """Prepare conditional input y (mask + first frame VAE encoding).
@@ -941,6 +947,7 @@ def main():
     from accelerate.utils import DataLoaderConfiguration
 
     accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
     )
 
@@ -1034,7 +1041,9 @@ def main():
         )
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.num_epochs * len(dataloader), eta_min=1e-6
+        optimizer,
+        T_max=args.num_epochs * max(1, len(dataloader) // args.gradient_accumulation_steps),
+        eta_min=1e-6,
     )
 
     model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
@@ -1075,7 +1084,8 @@ def main():
                             # trainable_params 列表，避免 ZeRO-3 下参数指针已迁移导致梯度裁剪静默失效
                             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                         optimizer.step()
-                        lr_scheduler.step()
+                        if accelerator.sync_gradients:
+                            lr_scheduler.step()
                         # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
                         if wb_logger is not None and accelerator.sync_gradients:
                             _loss_dict = {
