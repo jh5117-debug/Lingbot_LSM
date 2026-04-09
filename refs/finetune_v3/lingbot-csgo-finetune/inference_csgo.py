@@ -74,7 +74,7 @@ def main():
             torch_dtype=torch.bfloat16, control_type="act",
         )
 
-        lora_state = torch.load(args.lora_path, map_location="cpu")
+        lora_state = torch.load(args.lora_path, map_location="cpu", weights_only=True)
         target_modules = set()
         for key in lora_state.keys():
             parts = key.split(".")

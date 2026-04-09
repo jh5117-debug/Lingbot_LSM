@@ -1,20 +1,33 @@
 """
-LingBot-World CSGO Fine-tuning Training Script (Dual-Model MoE)
-================================================================
-Trains both high_noise_model (t >= 947) and low_noise_model (t < 947)
-using alternating epochs: even epochs train low_noise_model, odd epochs
-train high_noise_model. Both models use control_type='act' (7-channel).
+LingBot-World CSGO Fine-tuning Training Script (Single-Model)
+==============================================================
+Trains ONE model (low_noise_model or high_noise_model) per invocation.
+For dual-model MoE training, run this script twice via run_train_dual.sh.
+
+Design:
+  - Single DeepSpeed engine per run → no dual-engine conflicts
+  - ZeRO-3 without CPU offload → 8-10x faster than CPU offload
+  - T5 text encoding cached → avoids repeated GPU↔CPU transfers
+  - All previously identified bugs fixed
 
 Usage:
-    accelerate launch --config_file accelerate_config_zero2.yaml \
+    # Train low_noise_model (handles t < 947)
+    accelerate launch --config_file accelerate_config_dual.yaml \
         train_lingbot_csgo.py \
-        --ckpt_dir /home/nvme02/lingbot-world/models/lingbot-world-base-act/ \
-        --dataset_dir /home/nvme02/lingbot-world/datasets/csgo_processed_v3/ \
-        --output_dir /home/nvme02/lingbot-world/output/csgo_dual_ft/ \
-        --lora_rank 0 \
-        --learning_rate 1e-5 \
-        --num_epochs 10 \
-        --height 480 --width 832 --num_frames 81
+        --model_type low \
+        --ckpt_dir /home/nvme02/lingbot-world/models/lingbot-world-base-act \
+        --dataset_dir /home/nvme02/lingbot-world/datasets/processed_csgo_v3 \
+        --output_dir /home/nvme02/lingbot-world/output/dual_ft_v3 \
+        --num_epochs 5
+
+    # Train high_noise_model (handles t >= 947)
+    accelerate launch --config_file accelerate_config_dual.yaml \
+        train_lingbot_csgo.py \
+        --model_type high \
+        --ckpt_dir /home/nvme02/lingbot-world/models/lingbot-world-base-act \
+        --dataset_dir /home/nvme02/lingbot-world/datasets/processed_csgo_v3 \
+        --output_dir /home/nvme02/lingbot-world/output/dual_ft_v3 \
+        --num_epochs 5
 """
 
 import argparse
@@ -150,15 +163,16 @@ class LingBotTrainer:
         self.training_weights = y_shifted * (steps / y_shifted.sum())
 
         # Normalize weights per range so each model gets well-scaled gradients
-        # Without this, high_noise_model (t>=947) would get near-zero weights
-        # since the Gaussian peaks at t=500
         low_w = self.training_weights[self.low_noise_indices]
         self.low_noise_weights = low_w / low_w.mean()
         high_w = self.training_weights[self.high_noise_indices]
         self.high_noise_weights = high_w / high_w.mean()
 
-    def load_models(self, device):
-        """Load all model components (both high and low noise models)."""
+        # T5 encoding cache (prompt string -> tensor list)
+        self._t5_cache = {}
+
+    def load_model(self, device, model_type="low"):
+        """Load a single model and shared components (VAE, T5)."""
         self.device = device
         ckpt_dir = self.args.ckpt_dir
 
@@ -177,25 +191,30 @@ class LingBotTrainer:
             "get_Ks_transformed": get_Ks_transformed,
         }
 
-        logging.info("Loading low_noise_model (trainable)...")
-        self.low_noise_model = WanModel.from_pretrained(
-            ckpt_dir, subfolder="low_noise_model",
-            torch_dtype=torch.bfloat16, control_type="act",
-        )
-        self.low_noise_model.train()
-        wancamctrl = self.low_noise_model.patch_embedding_wancamctrl
-        logging.info(f"low_noise_model patch_embedding_wancamctrl: "
-                     f"Linear({wancamctrl.in_features}, {wancamctrl.out_features})")
+        subfolder = "low_noise_model" if model_type == "low" else "high_noise_model"
 
-        logging.info("Loading high_noise_model (trainable)...")
-        self.high_noise_model = WanModel.from_pretrained(
-            ckpt_dir, subfolder="high_noise_model",
+        # Check if fine-tuned checkpoint exists (for resuming)
+        load_dir = ckpt_dir
+        if self.args.resume_from:
+            resume_model_dir = os.path.join(self.args.resume_from, subfolder)
+            if os.path.isdir(resume_model_dir):
+                load_dir = self.args.resume_from
+                logging.info(f"Resuming from checkpoint: {resume_model_dir}")
+
+        logging.info(f"Loading {subfolder} from {load_dir}...")
+        model = WanModel.from_pretrained(
+            load_dir, subfolder=subfolder,
             torch_dtype=torch.bfloat16, control_type="act",
         )
-        self.high_noise_model.train()
-        wancamctrl_h = self.high_noise_model.patch_embedding_wancamctrl
-        logging.info(f"high_noise_model patch_embedding_wancamctrl: "
-                     f"Linear({wancamctrl_h.in_features}, {wancamctrl_h.out_features})")
+
+        # Extend control signal: rays_d(3) + action(8) = 11ch (base model has 7ch)
+        new_control_dim = 3 + self.args.action_dim  # default: 3 + 8 = 11
+        model = _extend_control_embedding(model, new_control_dim, subfolder)
+
+        model.train()
+        wancamctrl = model.patch_embedding_wancamctrl
+        logging.info(f"{subfolder} patch_embedding_wancamctrl: "
+                     f"Linear({wancamctrl.in_features}, {wancamctrl.out_features})")
 
         logging.info("Loading VAE...")
         self.vae = Wan2_1_VAE(
@@ -212,39 +231,6 @@ class LingBotTrainer:
             tokenizer_path=os.path.join(ckpt_dir, "google", "umt5-xxl"),
         )
 
-        return self.low_noise_model, self.high_noise_model
-
-    def setup_lora(self, model, lora_rank, lora_target_modules):
-        """Apply LoRA to the model."""
-        from peft import LoraConfig, inject_adapter_in_model
-
-        if lora_target_modules:
-            target_modules = lora_target_modules.split(",")
-        else:
-            target_modules = []
-            for name, module in model.named_modules():
-                if isinstance(module, torch.nn.Linear):
-                    for pattern in ["self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
-                                    "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
-                                    "ffn.0", "ffn.2",
-                                    "cam_injector_layer1", "cam_injector_layer2",
-                                    "cam_scale_layer", "cam_shift_layer"]:
-                        if pattern in name:
-                            target_modules.append(name)
-                            break
-
-        logging.info(f"LoRA target modules ({len(target_modules)}): {target_modules[:5]}...")
-
-        lora_config = LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules=target_modules)
-        model = inject_adapter_in_model(lora_config, model)
-
-        for param in model.parameters():
-            if param.requires_grad:
-                param.data = param.to(torch.bfloat16)
-
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        logging.info(f"LoRA: {trainable:,} trainable / {total:,} total params ({100*trainable/total:.2f}%)")
         return model
 
     def freeze_non_trainable(self, model, name="model"):
@@ -261,13 +247,20 @@ class LingBotTrainer:
 
     @torch.no_grad()
     def encode_text(self, prompt):
-        """prompt string -> list of text embedding tensors"""
+        """prompt string -> list of text embedding tensors (cached)."""
+        if prompt in self._t5_cache:
+            return [t.to(self.device) for t in self._t5_cache[prompt]]
+
         self.t5.model.to(self.device)
         context = self.t5([prompt], self.device)
         self.t5.model.cpu()
         torch.cuda.empty_cache()
+
+        # Cache on CPU to avoid GPU memory leak
+        self._t5_cache[prompt] = [t.cpu() for t in context]
         return [t.to(self.device) for t in context]
 
+    @torch.no_grad()
     def prepare_y(self, video_tensor, latent):
         """
         Prepare conditional input y (mask + first frame VAE encoding).
@@ -294,6 +287,7 @@ class LingBotTrainer:
         y = torch.concat([msk, y_latent])  # [20, lat_f, lat_h, lat_w]
         return y
 
+    @torch.no_grad()
     def prepare_control_signal(self, poses, actions, intrinsics, h, w, lat_f, lat_h, lat_w):
         """
         Prepare dit_cond_dict for act mode.
@@ -388,9 +382,14 @@ class LingBotTrainer:
             context = self.encode_text(prompt)
             y = self.prepare_y(video, video_latent)
 
-        dit_cond_dict = self.prepare_control_signal(
-            poses, actions, intrinsics, h, w, lat_f, lat_h, lat_w
-        )
+        # [FIX mem] free video tensor — no longer needed after prepare_y
+        del video
+
+        # [FIX bug#5] control signal wrapped in no_grad
+        with torch.no_grad():
+            dit_cond_dict = self.prepare_control_signal(
+                poses, actions, intrinsics, h, w, lat_f, lat_h, lat_w
+            )
 
         # Sample timestep from the appropriate range
         if model_type == "high":
@@ -414,7 +413,12 @@ class LingBotTrainer:
         # Target: velocity = noise - clean
         target = noise - video_latent
 
-        noisy_latent = noisy_latent.requires_grad_(True)
+        # [FIX mem] free intermediates before DiT forward
+        del noise, video_latent
+        torch.cuda.empty_cache()
+
+        # [FIX bug#4] removed: noisy_latent.requires_grad_(True)
+
         # Forward
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model(
@@ -432,6 +436,43 @@ class LingBotTrainer:
         loss = F.mse_loss(pred_rest.float(), target_rest.float())
         loss = loss * training_weight
         return loss
+
+
+# ============================================================
+# Control dimension extension helper
+# ============================================================
+
+def _extend_control_embedding(model, new_control_dim, name="model"):
+    """
+    Extend patch_embedding_wancamctrl to support more action channels.
+    Base model: control_dim=7 (rays_d 3 + WASD 4), Linear(1792, 5120).
+    Extended:   control_dim=11 (rays_d 3 + action 8), Linear(2816, 5120).
+
+    Pretrained weights for original 7 channels are preserved.
+    New channels are zero-initialized (no effect at start, learned during training).
+    """
+    old_linear = model.patch_embedding_wancamctrl
+    old_in = old_linear.in_features
+    out_dim = old_linear.out_features
+    ps = model.patch_size
+    factor = 64 * ps[0] * ps[1] * ps[2]  # spatial packing factor
+    old_control_dim = old_in // factor
+    new_in = new_control_dim * factor
+
+    if old_control_dim >= new_control_dim:
+        return model
+
+    logging.info(f"{name}: extending control_dim {old_control_dim} -> {new_control_dim} "
+                 f"(Linear {old_in} -> {new_in}, +{new_in - old_in} input features)")
+
+    new_linear = torch.nn.Linear(new_in, out_dim, dtype=old_linear.weight.dtype,
+                                 device=old_linear.weight.device)
+    torch.nn.init.zeros_(new_linear.weight)
+    torch.nn.init.zeros_(new_linear.bias)
+    new_linear.weight.data[:, :old_in] = old_linear.weight.data
+    new_linear.bias.data = old_linear.bias.data
+    model.patch_embedding_wancamctrl = new_linear
+    return model
 
 
 # ============================================================
@@ -477,27 +518,30 @@ def apply_gradient_checkpointing(model, model_name="model"):
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LingBot-World CSGO Fine-tuning (Dual-Model MoE)")
-    parser.add_argument("--ckpt_dir", type=str, required=True)
+    parser = argparse.ArgumentParser(description="LingBot-World CSGO Fine-tuning (Single-Model)")
+    parser.add_argument("--model_type", type=str, required=True, choices=["low", "high"],
+                        help="Which model to train: 'low' (t<947) or 'high' (t>=947)")
+    parser.add_argument("--ckpt_dir", type=str, required=True,
+                        help="Base model directory (lingbot-world-base-act)")
     parser.add_argument("--lingbot_code_dir", type=str,
                         default="/home/nvme02/lingbot-world/code/lingbot-world")
     parser.add_argument("--dataset_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Resume from a previous checkpoint directory")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--save_every_n_epochs", type=int, default=1)
-    parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--lora_rank", type=int, default=0,
-                        help="LoRA rank. 0 = full fine-tuning")
-    parser.add_argument("--lora_target_modules", type=str, default="")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--action_dim", type=int, default=8,
+                        help="Action dimensions in action.npy (4=WASD only, 8=WASD+jump/crouch/fire/walk)")
     return parser.parse_args()
 
 
@@ -505,32 +549,31 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 
+    model_type = args.model_type
+    subfolder = "low_noise_model" if model_type == "low" else "high_noise_model"
+
     import accelerate
     from accelerate.utils import DataLoaderConfiguration
     accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
     )
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        logging.info(f"Training {subfolder} (model_type={model_type})")
         logging.info(f"Args: {args}")
 
-    # Load both models
+    # Load single model + VAE + T5
     trainer = LingBotTrainer(args)
-    low_noise_model, high_noise_model = trainer.load_models(accelerator.device)
+    model = trainer.load_model(accelerator.device, model_type)
 
-    # Setup LoRA or full fine-tuning for both models
-    if args.lora_rank > 0:
-        low_noise_model = trainer.setup_lora(low_noise_model, args.lora_rank, args.lora_target_modules)
-        high_noise_model = trainer.setup_lora(high_noise_model, args.lora_rank, args.lora_target_modules)
-    else:
-        trainer.freeze_non_trainable(low_noise_model, "low_noise_model")
-        trainer.freeze_non_trainable(high_noise_model, "high_noise_model")
+    # Full fine-tuning (all params trainable)
+    trainer.freeze_non_trainable(model, subfolder)
 
-    # Apply gradient checkpointing to both models
+    # Gradient checkpointing
     if args.gradient_checkpointing:
-        apply_gradient_checkpointing(low_noise_model, "low_noise_model")
-        apply_gradient_checkpointing(high_noise_model, "high_noise_model")
+        apply_gradient_checkpointing(model, subfolder)
 
     # Dataset and dataloader
     dataset = CSGODataset(
@@ -540,146 +583,133 @@ def main():
     )
     dataloader = DataLoader(
         dataset, batch_size=1, shuffle=True,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True,
         collate_fn=lambda x: x[0],
     )
 
-    # Separate optimizers for each model
-    low_params = [p for p in low_noise_model.parameters() if p.requires_grad]
-    high_params = [p for p in high_noise_model.parameters() if p.requires_grad]
-
-    low_optimizer = torch.optim.AdamW(low_params, lr=args.learning_rate,
-                                       weight_decay=args.weight_decay)
-    high_optimizer = torch.optim.AdamW(high_params, lr=args.learning_rate,
-                                        weight_decay=args.weight_decay)
-
-    total_steps_per_model = (args.num_epochs // 2) * len(dataloader)
-    low_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        low_optimizer, T_max=max(total_steps_per_model, 1), eta_min=1e-6
-    )
-    high_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        high_optimizer, T_max=max(total_steps_per_model, 1), eta_min=1e-6
+    # Optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
     )
 
-    # Prepare with accelerator — each model gets its own DeepSpeed engine
-    low_noise_model, low_optimizer, dataloader, low_scheduler = accelerator.prepare(
-        low_noise_model, low_optimizer, dataloader, low_scheduler
-    )
-    high_noise_model, high_optimizer, high_scheduler = accelerator.prepare(
-        high_noise_model, high_optimizer, high_scheduler
+    # [FIX bug#3] T_max based on optimizer steps, accounting for distributed
+    # len(dataloader) before prepare() returns TOTAL batches, not per-GPU
+    iters_per_epoch = math.ceil(len(dataset) / accelerator.num_processes)
+    steps_per_epoch = iters_per_epoch // args.gradient_accumulation_steps
+    total_steps = args.num_epochs * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps, 1), eta_min=1e-6
     )
 
-    # Training loop: alternate epochs between models
+    # Prepare with accelerator — single DeepSpeed engine, no conflicts
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model, optimizer, dataloader, scheduler
+    )
+
+    # Pre-warm T5 cache: encode a dummy prompt to avoid cold start
+    if accelerator.is_main_process:
+        logging.info("Pre-warming T5 cache...")
+    _ = trainer.encode_text("First-person view of CS:GO competitive gameplay")
+
+    # Move T5 to CPU permanently after cache warm-up to free GPU memory
+    trainer.t5.model.cpu()
+    torch.cuda.empty_cache()
+
+    if accelerator.is_main_process:
+        logging.info(f"Training config: {args.num_epochs} epochs, "
+                     f"{len(dataloader)} iters/epoch, "
+                     f"grad_accum={args.gradient_accumulation_steps}, "
+                     f"optimizer_steps/epoch={steps_per_epoch}, "
+                     f"total_optimizer_steps={total_steps}")
+
+    # Training loop
     global_step = 0
     for epoch in range(args.num_epochs):
-        # Even epochs (0, 2, 4, ...) -> low_noise_model
-        # Odd epochs (1, 3, 5, ...) -> high_noise_model
-        if epoch % 2 == 0:
-            current_model = low_noise_model
-            current_optimizer = low_optimizer
-            current_scheduler = low_scheduler
-            current_params = low_params
-            model_type = "low"
-            model_name = "low_noise_model"
-        else:
-            current_model = high_noise_model
-            current_optimizer = high_optimizer
-            current_scheduler = high_scheduler
-            current_params = high_params
-            model_type = "high"
-            model_name = "high_noise_model"
-
-        current_model.train()
+        model.train()
         epoch_loss = 0.0
         num_batches = 0
 
         progress = tqdm(dataloader, disable=not accelerator.is_main_process,
-                        desc=f"Epoch {epoch+1}/{args.num_epochs} [{model_name}]")
+                        desc=f"Epoch {epoch+1}/{args.num_epochs} [{subfolder}]")
 
         for batch in progress:
-            with accelerator.accumulate(current_model):
+            with accelerator.accumulate(model):
                 loss = trainer.training_step(
-                    accelerator.unwrap_model(current_model), batch, model_type
+                    accelerator.unwrap_model(model), batch, model_type
                 )
                 accelerator.backward(loss)
+
+                # [FIX bug#2] use model.parameters() not stale param list
+                # [FIX bug#1] only clip/step scheduler on sync_gradients
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(current_params, args.max_grad_norm)
-                current_optimizer.step()
-                current_scheduler.step()
-                current_optimizer.zero_grad()
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                optimizer.step()
+
+                if accelerator.sync_gradients:
+                    scheduler.step()
+
+                optimizer.zero_grad()
 
             epoch_loss += loss.item()
             num_batches += 1
-            global_step += 1
+            if accelerator.sync_gradients:
+                global_step += 1
+
             progress.set_postfix(
                 loss=f"{loss.item():.4f}",
-                lr=f"{current_scheduler.get_last_lr()[0]:.2e}",
-                model=model_type,
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                step=global_step,
             )
-
-            if args.save_steps and global_step % args.save_steps == 0:
-                save_checkpoint(accelerator, low_noise_model, high_noise_model, args,
-                                f"step_{global_step}")
 
         avg_loss = epoch_loss / max(num_batches, 1)
         if accelerator.is_main_process:
-            logging.info(f"Epoch {epoch+1}/{args.num_epochs} [{model_name}] - avg_loss: {avg_loss:.4f}")
+            logging.info(f"Epoch {epoch+1}/{args.num_epochs} [{subfolder}] "
+                         f"- avg_loss: {avg_loss:.4f}, lr: {scheduler.get_last_lr()[0]:.2e}")
 
         if (epoch + 1) % args.save_every_n_epochs == 0:
-            save_checkpoint(accelerator, low_noise_model, high_noise_model, args,
-                            f"epoch_{epoch+1}")
+            save_checkpoint(accelerator, model, args, subfolder, f"epoch_{epoch+1}")
 
-    save_checkpoint(accelerator, low_noise_model, high_noise_model, args, "final")
+    # Final save
+    save_checkpoint(accelerator, model, args, subfolder, "final")
     if accelerator.is_main_process:
-        logging.info("Training complete!")
+        logging.info(f"Training complete! {subfolder} saved to {args.output_dir}/final/{subfolder}")
 
 
-def save_checkpoint(accelerator, low_noise_model, high_noise_model, args, tag):
-    """Save both models' checkpoints in the original directory structure."""
+def save_checkpoint(accelerator, model, args, subfolder, tag):
+    """Save model checkpoint compatible with WanModel.from_pretrained()."""
     save_dir = os.path.join(args.output_dir, tag)
+    model_dir = os.path.join(save_dir, subfolder)
 
-    if args.lora_rank > 0:
-        # LoRA: only main process needs to save, no collective operation
-        if accelerator.is_main_process:
-            for model, name in [(low_noise_model, "low_noise_model"),
-                                 (high_noise_model, "high_noise_model")]:
-                model_dir = os.path.join(save_dir, name)
-                os.makedirs(model_dir, exist_ok=True)
-                unwrapped = accelerator.unwrap_model(model)
-                lora_state_dict = {
-                    n: p.data.cpu()
-                    for n, p in unwrapped.named_parameters()
-                    if p.requires_grad
-                }
-                torch.save(lora_state_dict, os.path.join(model_dir, "lora_weights.pth"))
-                logging.info(f"Saved LoRA [{name}] ({len(lora_state_dict)} params) -> {model_dir}")
-    else:
-        # ZeRO-3: use DeepSpeed's native save_16bit_model
-        if accelerator.is_main_process:
-            os.makedirs(save_dir, exist_ok=True)
-        accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        os.makedirs(model_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
-        for model, name in [(low_noise_model, "low_noise_model"),
-                             (high_noise_model, "high_noise_model")]:
-            model_dir = os.path.join(save_dir, name)
-            if accelerator.is_main_process:
-                os.makedirs(model_dir, exist_ok=True)
-            accelerator.wait_for_everyone()
+    # save_16bit_model: collective op, gathers ZeRO-3 shards, rank 0 writes
+    model.save_16bit_model(model_dir, "diffusion_pytorch_model.bin")
 
-            # save_16bit_model is a collective op: all ranks gather, rank 0 writes
-            model.save_16bit_model(model_dir, "diffusion_pytorch_model.bin")
+    if accelerator.is_main_process:
+        # Save config.json for from_pretrained() compatibility
+        unwrapped = accelerator.unwrap_model(model)
+        # Update control_dim in config so from_pretrained creates correct Linear size
+        new_control_dim = 3 + args.action_dim
+        if new_control_dim != 7:
+            unwrapped.config["control_dim"] = new_control_dim
+        unwrapped.save_config(model_dir)
 
-            if accelerator.is_main_process:
-                unwrapped = accelerator.unwrap_model(model)
-                unwrapped.save_config(model_dir)
-                # Verify saved weights
-                saved_path = os.path.join(model_dir, "diffusion_pytorch_model.bin")
-                sd = torch.load(saved_path, map_location="cpu", weights_only=True)
-                n_empty = sum(1 for v in sd.values() if v.numel() == 0)
-                logging.info(f"Saved {name} -> {model_dir} ({len(sd)} params, {n_empty} empty)")
-                if n_empty > 0:
-                    logging.error(f"WARNING: {n_empty} parameters have empty tensors in {name}!")
-                del sd
+        # Verify
+        saved_path = os.path.join(model_dir, "diffusion_pytorch_model.bin")
+        if os.path.exists(saved_path):
+            sd = torch.load(saved_path, map_location="cpu", weights_only=True)
+            n_empty = sum(1 for v in sd.values() if v.numel() == 0)
+            size_mb = os.path.getsize(saved_path) / (1024 * 1024)
+            logging.info(f"Saved {subfolder} -> {model_dir} "
+                         f"({len(sd)} params, {n_empty} empty, {size_mb:.0f} MB)")
+            if n_empty > 0:
+                logging.error(f"WARNING: {n_empty} parameters have empty tensors!")
+            del sd
 
     accelerator.wait_for_everyone()
 

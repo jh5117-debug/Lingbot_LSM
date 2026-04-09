@@ -1,25 +1,24 @@
 """
 CSGO Dataset Preprocessor v3 for LingBot-World Fine-tuning
 ===========================================================
-Adapted for the new Solaris dataset format (2026-03-25+):
+Adapted for the v3 Solaris dataset format (dust2-80-32fps):
   - Per-episode subdirectories: train/Ep_NNNNNN/<stem>.*
-  - 64 FPS video (tf_ratio=2, tickrate=128)
-  - frame_count in JSON jumps by tf_ratio (0, 2, 4, ...)
-  - game_manifest.json per episode (map_name, player info)
+  - 32 FPS video (tf_ratio=4, tickrate=128)
+  - frame_count in JSON jumps by tf_ratio (0, 4, 8, ...)
   - episode_info has explicit tf_ratio, video_fps, start_tick
   - Richer action fields (jump, crouch, walk, fire, reload, use, look_dx, look_dy, weapon_slot)
   - camera_rotation vec3 available (replaces root yaw/pitch for rotation)
   - 10 players per episode (5v5), each with independent video + action + pose
+  - Depth videos (_depth.mkv) and 3D mesh data available (used in Stage 2)
 
 Usage:
     python preprocess_csgo_v3.py \\
-        --input_dir /home/nvme02/lingbot-world/datasets/new_sample/bcc3a2ac490c4888bcb97c3553a25671/ \\
-        --output_dir /home/nvme02/lingbot-world/datasets/csgo_processed_v3/ \\
+        --input_dir /home/nvme02/lingbot-world/datasets/raw_csgo_v3/dust2-80-32fps/aef9560bbce0c405/e61e20c503eb4af78d4b2011f945aca0/ \\
+        --output_dir /home/nvme02/lingbot-world/datasets/processed_csgo_v3/ \\
         --clip_frames 81 \\
         --target_fps 16 \\
         --height 480 --width 832 \\
-        --stride 40 \\
-        --skip_episodes "000004"
+        --stride 40
 """
 
 import argparse
@@ -78,13 +77,20 @@ def find_player_streams(input_dir, skip_episodes=None):
                 print(f"[SKIP] Episode {episode_id} (in skip list)")
                 continue
 
-            # Load game manifest for map name
+            # Detect map name from game_manifest.json or directory path
             manifest_path = os.path.join(ep_dir, "game_manifest.json")
             map_name = "unknown"
             if os.path.exists(manifest_path):
                 with open(manifest_path, "r") as f:
                     manifest = json.load(f)
                 map_name = manifest.get("map_name", "unknown")
+            if map_name == "unknown":
+                # Fallback: detect from parent directory names
+                path_lower = ep_dir.lower()
+                for m in ["dust2", "mirage", "inferno", "nuke", "overpass", "ancient", "anubis", "vertigo"]:
+                    if m in path_lower:
+                        map_name = f"de_{m}"
+                        break
 
             # Find all episode_info files to discover player streams
             for fname in sorted(os.listdir(ep_dir)):
@@ -120,8 +126,8 @@ def find_player_streams(input_dir, skip_episodes=None):
                     "info": info,
                     "ep_dir": ep_dir,
                     "map_name": map_name,
-                    "video_fps": info.get("video_fps", 64),
-                    "tf_ratio": info.get("tf_ratio", 2),
+                    "video_fps": info.get("video_fps", 32),
+                    "tf_ratio": info.get("tf_ratio", 4),
                     "tickrate": info.get("tickrate", 128),
                 })
 
@@ -235,7 +241,8 @@ def load_action_data(action_path):
         frames = json.load(f)
 
     # Build lookup by frame_count for fast access
-    # New format: frame_count jumps (0, 2, 4, ...) due to tf_ratio=2
+    # v3 format: frame_count increments by 1 per video frame (0, 1, 2, 3, ...)
+    # Each video frame has exactly one action entry (1:1 mapping)
     by_frame_count = {}
     for af in frames:
         fc = af.get("frame_count", af.get("frame_idx", af.get("frame_index", None)))
@@ -248,27 +255,21 @@ def load_action_data(action_path):
 def align_video_to_action(video_frame_indices, by_frame_count, tf_ratio):
     """
     Map video frame indices to action frame data.
-    
-    Video is at video_fps (e.g. 64fps).
-    Action JSON has one entry per tf_ratio video frames (e.g. every 2nd frame).
-    So action frame_count = video_frame_index (since frame_count counts video frames,
-    but only every tf_ratio-th frame has an action entry).
-    
-    For video frame i, the corresponding action frame_count = i 
-    (but only even frame_counts exist in the JSON when tf_ratio=2).
-    We map each video frame to the nearest available action frame.
+
+    v3 data: frame_count = video frame index (1:1), increments by 1.
+    After downsampling (e.g. 32fps→16fps, skip=2), we keep frames 0, 2, 4, ...
+    Each of these has a direct action entry at frame_count = vid_idx.
+
+    Fallback: if exact match not found, try nearest neighbors.
     """
     aligned = []
     for vid_idx in video_frame_indices:
-        # frame_count in the JSON corresponds directly to video frame index
-        # but only multiples of tf_ratio exist
-        # Find nearest: round down to nearest multiple of tf_ratio
-        fc = (vid_idx // tf_ratio) * tf_ratio
-        af = by_frame_count.get(fc)
+        # Direct 1:1 lookup first
+        af = by_frame_count.get(vid_idx)
         if af is None:
-            # Try adjacent
-            for offset in [tf_ratio, -tf_ratio, 2*tf_ratio]:
-                af = by_frame_count.get(fc + offset)
+            # Fallback: try nearby frame_counts
+            for offset in [1, -1, 2, -2]:
+                af = by_frame_count.get(vid_idx + offset)
                 if af is not None:
                     break
         aligned.append(af)
@@ -287,20 +288,36 @@ def extract_pose_from_action_frame(af, default_fov=106.26):
     if af is None:
         return None
 
-    # Get camera position (eye height, more accurate than root x/y/z)
+    # Skip dead player frames (health=0 → spectator camera, unusable)
+    if af.get("health", 100) <= 0:
+        return None
+
+    # Get camera position:
+    # Priority: render_transform (x,y) + camera_position (z, includes eye height)
+    # render_transform is the client-side rendered position, sub-tick interpolated,
+    # exactly matching the video frame. camera_position z includes eye height offset.
+    # Fallback: camera_position → root x/y/z
+    rt = af.get("render_transform")
     cam_pos = af.get("camera_position")
-    if cam_pos is not None:
+    if rt is not None and rt.get("x") is not None:
+        x = rt["x"]
+        y = rt["y"]
+        # Use camera_position z for eye height; fallback to render_transform z
+        z = cam_pos[2] if cam_pos is not None else rt["z"]
+    elif cam_pos is not None:
         x, y, z = cam_pos[0], cam_pos[1], cam_pos[2]
     else:
         x = af.get("x", 0.0)
         y = af.get("y", 0.0)
         z = af.get("z", 0.0)
 
-    # Get rotation - prefer camera_rotation if available
+    # Get rotation - use camera_rotation (verified field order)
+    # Note: render_transform.yaw uses a different coordinate convention and
+    # render_transform.pitch is often 0.0, so camera_rotation is more reliable
     cam_rot = af.get("camera_rotation")
     if cam_rot is not None:
-        # camera_rotation is [pitch, roll, yaw] in degrees
-        pitch = cam_rot[0]
+        # camera_rotation is [roll, pitch, yaw] in degrees
+        pitch = cam_rot[1]
         yaw = cam_rot[2]
     else:
         yaw = af.get("yaw", 0.0)
@@ -308,13 +325,17 @@ def extract_pose_from_action_frame(af, default_fov=106.26):
 
     pose = csgo_to_pose_matrix(yaw, pitch, x, y, z)
 
-    # Action: [forward, back, left, right] as int 0/1
+    # Action: [forward, back, left, right, jump, crouch, fire, walk] as int 0/1
     act = af.get("action", {})
     action = [
         int(bool(act.get("forward", False))),
         int(bool(act.get("back", False))),
         int(bool(act.get("left", False))),
         int(bool(act.get("right", False))),
+        int(bool(act.get("jump", False))),
+        int(bool(act.get("crouch", False))),
+        int(bool(act.get("fire", False))),
+        int(bool(act.get("walk", False))),
     ]
 
     return pose, action, default_fov
@@ -399,7 +420,7 @@ def process_stream(stream, output_dir, clip_frames=81, target_fps=16,
             continue
 
         poses = np.array(poses, dtype=np.float32)    # [N, 4, 4]
-        actions = np.array(actions, dtype=np.int32)   # [N, 4]
+        actions = np.array(actions, dtype=np.int32)   # [N, 8]
 
         # Filter static clips
         if is_static_clip(poses):
@@ -477,7 +498,7 @@ def main():
     parser.add_argument("--clip_frames", type=int, default=81,
                         help="Frames per clip (must be 4n+1)")
     parser.add_argument("--target_fps", type=int, default=16,
-                        help="Target FPS after downsampling")
+                        help="Target FPS after downsampling (v3 32fps / 2 = 16fps)")
     parser.add_argument("--height", type=int, default=480, help="Output video height")
     parser.add_argument("--width", type=int, default=832, help="Output video width")
     parser.add_argument("--stride", type=int, default=40,
