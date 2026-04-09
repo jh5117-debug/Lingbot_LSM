@@ -17,7 +17,7 @@ NUM_EPOCHS=50
 LEARNING_RATE=1e-4         # memory 模块学习率（Stage2 全参时 DiT 用 --lr_dit）
 LR_DIT=1e-5               # Stage2 DiT 学习率
 WEIGHT_DECAY=0.01
-GRADIENT_ACCUMULATION_STEPS=4
+GRADIENT_ACCUMULATION_STEPS=8    # 4 GPU × 8 accum = effective batch 32（与 8-GPU × 4 等效）
 MAX_GRAD_NORM=1.0
 SAVE_EVERY_N_EPOCHS=5
 DATASET_REPEAT=1
@@ -26,7 +26,7 @@ HEIGHT=480
 WIDTH=832
 NFP_LOSS_WEIGHT=0.1
 
-CUDA_VISIBLE_DEVICES="4,5,6,7"  # 使用哪几张 GPU，例如 "0"、"0,1"、"0,1,2,3,4,5,6,7"
+CUDA_VISIBLE_DEVICES="0,1,2,3"  # 使用哪几张 GPU，例如 "0"、"0,1"、"0,1,2,3,4,5,6,7"
 
 # ============================================================
 # 以下内容通常无需修改
