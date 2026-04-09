@@ -10,8 +10,8 @@ set -euo pipefail
 LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调
 LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
-CKPT_DIR="/home/nvme03/wlx/Memory/models/lingbot-world-base-act"
-DATASET_DIR="/home/nvme03/wlx/Memory/datasets/processed_csgo_v3"
+CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
+DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"
 OUTPUT_DIR="/home/nvme03/wlx/Memory/outputs/train_v2_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
