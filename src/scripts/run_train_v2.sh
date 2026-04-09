@@ -10,7 +10,7 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"                # lingbot-world 预训练权重目录
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"             # CSGO 数据集目录（含 metadata_train.csv）
-OUTPUT_DIR="/home/nvme03/wlx/Memory/outputs/train_v2_stage1"
+OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1"
 RESUME_FROM=""             # 断点续训路径（留空从头开始）
 
 NUM_EPOCHS=50
