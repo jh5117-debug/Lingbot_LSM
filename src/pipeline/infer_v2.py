@@ -123,6 +123,13 @@ def _parse_args():
 
 
 # ---------------------------------------------------------------------------
+# Memory 模块 key 识别（LoRA/HF checkpoint 权重提取共用）
+# ---------------------------------------------------------------------------
+
+_MEMORY_KEY_PATTERNS = ("memory_cross_attn", "memory_norm", "nfp_head", "latent_proj")
+
+
+# ---------------------------------------------------------------------------
 # LoRA 加载（与 inference_csgo.py 完全一致）
 # ---------------------------------------------------------------------------
 
@@ -219,7 +226,6 @@ def _load_lora_and_prepare_ckpt(args) -> str:
     # lora_weights.pth 同时含有 LoRA adapter 权重 + memory 模块权重（gate/nfp_head/latent_proj）。
     # WanModel 不认识 memory 相关 key → load_state_dict 时被丢弃；需单独保存后由
     # _convert_pipeline_to_memory 加载，确保训练好的 gate/nfp_head/latent_proj 在推理时生效。
-    _MEMORY_KEY_PATTERNS = ("memory_cross_attn", "memory_norm", "nfp_head", "latent_proj")
     memory_weights = {
         k: v for k, v in lora_state.items()
         if any(pat in k for pat in _MEMORY_KEY_PATTERNS)
@@ -267,9 +273,6 @@ def _load_ft_model_and_prepare_ckpt(args) -> str:
 # Memory 辅助（复用 infer.py 中的逻辑）
 # ---------------------------------------------------------------------------
 
-_MEMORY_KEY_PATTERNS = ("memory_cross_attn", "memory_norm", "nfp_head", "latent_proj")
-
-
 def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
     """从 HuggingFace 格式 checkpoint 中提取 memory module 权重。
 
@@ -304,10 +307,9 @@ def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
 def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path=None, high_model_dir=None):
     """将 WanI2V 管道的 low_noise_model 替换为 WanModelWithMemory。
 
-    注意：只转换 low_noise_model，不转换 high_noise_model。
-    原因：high_noise_model 的 forward 签名可能与 low_noise_model 不同，
-    且 memory 模块只在低噪声侧有意义（高噪声侧负责全局结构，
-    不需要细粒度的历史帧检索）。high_noise_model 保持原始 WanModel 不变。
+    默认只转换 low_noise_model。若提供 high_model_dir（来自 --ft_high_model_dir，
+    对应 train_v2_stage1_dual.py 的 high_noise_model 输出），则同时将 high_noise_model
+    转换为 WanModelWithMemory 并加载对应 memory 权重（dual 推理模式）。
     """
     from memory_module.model_with_memory import WanModelWithMemory
 
@@ -363,9 +365,9 @@ def _patch_pipeline_memory(pipeline, memory_states, memory_value_states=None):
     MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
     新增 memory_value_states 参数（visual_emb），作为 cross-attention 的 V。
 
-    注意：只 patch low_noise_model，不 patch high_noise_model。
-    high_noise_model 保持原始 WanModel（未转换为 WanModelWithMemory），
-    其 forward 签名与 WanModelWithMemory 不同，不应注入 memory。
+    注意：默认只 patch low_noise_model。若 high_noise_model 已转换为 WanModelWithMemory
+    （dual 推理模式，通过 --ft_high_model_dir 启用），则同时 patch high_noise_model，
+    两个模型共享同一份 memory_states / memory_value_states（来自同一 MemoryBank）。
     复用 infer.py 的 _patch_pipeline_memory 逻辑（FIX[B-01]：使用 functools.partial）。
     """
     if memory_states is None:
@@ -400,7 +402,7 @@ def _patch_pipeline_memory(pipeline, memory_states, memory_value_states=None):
 
 
 def _unpatch_pipeline_memory(pipeline):
-    """还原 _patch_pipeline_memory 的 monkey-patch（仅 low_noise_model）。"""
+    """还原 _patch_pipeline_memory 的 monkey-patch（low_noise_model，以及 dual 模式下的 high_noise_model）。"""
     model = pipeline.low_noise_model
     if hasattr(model, '_original_forward'):
         model.forward = model._original_forward
