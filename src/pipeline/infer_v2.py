@@ -25,6 +25,17 @@ infer_v2.py — CSGO 推理脚本，完全对齐 csgo-finetune-v2/inference_csgo
         --prompt "First-person view of CS:GO gameplay" \\
         --size 480*832 --frame_num 81 \\
         --use_memory --memory_max_size 50
+
+用法（启用 memory + dual 模型，对应 train_v2_stage1_dual.py 输出）：
+    torchrun --nproc_per_node=4 infer_v2.py \\
+        --ckpt_dir /path/to/lingbot-world-base-act/ \\
+        --ft_model_dir /path/to/output/low_noise_model/ \\
+        --ft_high_model_dir /path/to/output/high_noise_model/ \\
+        --image /path/to/image.jpg \\
+        --action_path /path/to/clip/ \\
+        --prompt "First-person view of CS:GO competitive gameplay" \\
+        --size 480*832 --frame_num 81 \\
+        --use_memory --memory_max_size 50 --num_clips 5
 """
 
 import argparse
@@ -73,6 +84,10 @@ def _parse_args():
                         help="LoRA 权重 .pth 文件路径（可选）")
     parser.add_argument("--ft_model_dir", type=str, default=None,
                         help="全参微调 low_noise_model 目录（可选，与 --lora_path 互斥）")
+    parser.add_argument("--ft_high_model_dir", type=str, default=None,
+                        help="dual 训练中 high_noise_model 输出目录（可选；"
+                             "train_v2_stage1_dual.py 输出的 OUTPUT_DIR/high_noise_model/）。"
+                             "提供时同时对 high_noise_model 启用 WanModelWithMemory。")
     parser.add_argument("--image", type=str, required=True,
                         help="初始帧图像路径")
     parser.add_argument("--action_path", type=str, default=None,
@@ -231,7 +246,15 @@ def _load_ft_model_and_prepare_ckpt(args) -> str:
     import tempfile
     tmp_dir = tempfile.mkdtemp(prefix='act_')
     os.symlink(args.ft_model_dir, os.path.join(tmp_dir, "low_noise_model"))
-    for item in ["high_noise_model", "Wan2.1_VAE.pth", "models_t5_umt5-xxl-enc-bf16.pth",
+
+    # high_noise_model: dual 训练时使用 ft_high_model_dir，否则回退到 base ckpt
+    _ft_high = getattr(args, "ft_high_model_dir", None)
+    _high_src = _ft_high if _ft_high else os.path.join(args.ckpt_dir, "high_noise_model")
+    _high_dst = os.path.join(tmp_dir, "high_noise_model")
+    if os.path.exists(_high_src) and not os.path.exists(_high_dst):
+        os.symlink(_high_src, _high_dst)
+
+    for item in ["Wan2.1_VAE.pth", "models_t5_umt5-xxl-enc-bf16.pth",
                  "google", "configuration.json"]:
         src = os.path.join(args.ckpt_dir, item)
         dst = os.path.join(tmp_dir, item)
@@ -244,7 +267,41 @@ def _load_ft_model_and_prepare_ckpt(args) -> str:
 # Memory 辅助（复用 infer.py 中的逻辑）
 # ---------------------------------------------------------------------------
 
-def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path=None):
+_MEMORY_KEY_PATTERNS = ("memory_cross_attn", "memory_norm", "nfp_head", "latent_proj")
+
+
+def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
+    """从 HuggingFace 格式 checkpoint 中提取 memory module 权重。
+
+    WanModelWithMemory.save_pretrained() 将所有权重（含 memory modules）保存为
+    safetensors 或 pytorch_model*.bin。WanModel.from_pretrained() 加载时忽略 memory
+    相关 key（unexpected_keys）；本函数提取这些被忽略的权重，供 load_state_dict(strict=False) 使用。
+    """
+    import glob
+    state = {}
+    sf_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if sf_files:
+        try:
+            from safetensors.torch import load_file
+            for f in sf_files:
+                state.update(load_file(f, device="cpu"))
+        except ImportError:
+            logger.warning("safetensors not available, trying torch.load for %s", model_dir)
+    if not state:
+        bin_files = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin")))
+        for f in bin_files:
+            state.update(torch.load(f, map_location="cpu", weights_only=True))
+
+    memory_state = {k: v for k, v in state.items()
+                    if any(pat in k for pat in _MEMORY_KEY_PATTERNS)}
+    logger.info(
+        "_load_memory_weights_from_hf_checkpoint: found %d memory keys in %s",
+        len(memory_state), model_dir,
+    )
+    return memory_state
+
+
+def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path=None, high_model_dir=None):
     """将 WanI2V 管道的 low_noise_model 替换为 WanModelWithMemory。
 
     注意：只转换 low_noise_model，不转换 high_noise_model。
@@ -271,6 +328,31 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
             len(_mem_state), memory_ckpt_path, len(_result.missing_keys),
         )
 
+    # dual 模型支持：若 high_model_dir 提供，同时对 high_noise_model 做 WanModelWithMemory 转换
+    if high_model_dir is not None:
+        logger.info(
+            "Converting high_noise_model to WanModelWithMemory (dual mode, max_size=%d)...",
+            memory_max_size,
+        )
+        pipeline.high_noise_model = WanModelWithMemory.from_wan_model(
+            pipeline.high_noise_model,
+            memory_layers=None,
+            max_memory_size=memory_max_size,
+        )
+        _high_mem_state = _load_memory_weights_from_hf_checkpoint(high_model_dir)
+        if _high_mem_state:
+            _result = pipeline.high_noise_model.load_state_dict(_high_mem_state, strict=False)
+            logger.info(
+                "Loaded %d memory weights for high_noise_model (missing=%d)",
+                len(_high_mem_state), len(_result.missing_keys),
+            )
+        else:
+            logger.warning(
+                "No memory weights found in high_model_dir=%s; "
+                "high_noise_model memory modules start from scratch.",
+                high_model_dir,
+            )
+
     logger.info("Pipeline conversion to WanModelWithMemory done.")
     return pipeline
 
@@ -292,24 +374,29 @@ def _patch_pipeline_memory(pipeline, memory_states, memory_value_states=None):
     import functools
     from memory_module.model_with_memory import WanModelWithMemory
 
+    def _make_patched(m, mem, mem_val):
+        @functools.wraps(m.forward)
+        def _patched(x, t, context, seq_len, y=None, dit_cond_dict=None):
+            _dev = next(m.parameters()).device
+            _mem_val = mem_val.to(_dev) if mem_val is not None else None
+            return WanModelWithMemory.forward(
+                m, x, t, context, seq_len,
+                y=y, dit_cond_dict=dit_cond_dict,
+                memory_states=mem.to(_dev),
+                memory_value_states=_mem_val,  # MODIFIED: F-03/F5 fix
+            )
+        return _patched
+
     model = pipeline.low_noise_model
     if isinstance(model, WanModelWithMemory):
         model._original_forward = model.forward
-
-        def _make_patched(m, mem, mem_val):
-            @functools.wraps(m.forward)
-            def _patched(x, t, context, seq_len, y=None, dit_cond_dict=None):
-                _dev = next(m.parameters()).device
-                _mem_val = mem_val.to(_dev) if mem_val is not None else None
-                return WanModelWithMemory.forward(
-                    m, x, t, context, seq_len,
-                    y=y, dit_cond_dict=dit_cond_dict,
-                    memory_states=mem.to(_dev),
-                    memory_value_states=_mem_val,  # MODIFIED: F-03/F5 fix
-                )
-            return _patched
-
         model.forward = _make_patched(model, memory_states, memory_value_states)
+
+    # dual 模型支持：若 high_noise_model 也是 WanModelWithMemory，同样注入 memory
+    high_model = pipeline.high_noise_model
+    if isinstance(high_model, WanModelWithMemory):
+        high_model._original_forward = high_model.forward
+        high_model.forward = _make_patched(high_model, memory_states, memory_value_states)
 
 
 def _unpatch_pipeline_memory(pipeline):
@@ -318,6 +405,12 @@ def _unpatch_pipeline_memory(pipeline):
     if hasattr(model, '_original_forward'):
         model.forward = model._original_forward
         del model._original_forward
+
+    # dual 模型支持：同时还原 high_noise_model 的 patch（若有）
+    high_model = pipeline.high_noise_model
+    if hasattr(high_model, '_original_forward'):
+        high_model.forward = high_model._original_forward
+        del high_model._original_forward
 
 
 def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
@@ -497,6 +590,7 @@ def main():
             wan_i2v,
             memory_max_size=args.memory_max_size,
             memory_ckpt_path=_memory_ckpt_path,  # V5-B2-01 fix: LoRA 模式下加载训练好的 memory 权重
+            high_model_dir=args.ft_high_model_dir,   # NEW: dual 模型支持
         )
         memory_bank = MemoryBank(max_size=args.memory_max_size)
         logger.info("MemoryBank created: %s", memory_bank)
