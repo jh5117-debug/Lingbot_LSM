@@ -13,8 +13,8 @@ deepspeed_config:
   reduce_scatter: true
   reduce_bucket_size: 2e8
   contiguous_gradients: true
-  offload_optimizer_device: none    # 原: cpu — 如需 CPU offload 改回 cpu
-  # offload_optimizer_pin_memory: true  # 配合 offload_optimizer_device: cpu 使用
+  offload_optimizer_device: cpu
+  offload_optimizer_pin_memory: true
   offload_param_device: none
   zero3_init_flag: false
 distributed_type: DEEPSPEED
