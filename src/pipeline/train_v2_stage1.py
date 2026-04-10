@@ -843,6 +843,8 @@ def save_checkpoint(accelerator, model, args, tag: str):
     else:
         if accelerator.is_main_process:
             os.makedirs(save_dir, exist_ok=True)
+        gc.collect()
+        torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
 
         # ZeRO-3：use DeepSpeed's native save_16bit_model
