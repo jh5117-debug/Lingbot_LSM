@@ -16,13 +16,13 @@ OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
-NUM_EPOCHS=50
+NUM_EPOCHS=4
 LEARNING_RATE=1e-4
 LR_DIT=1e-5
 WEIGHT_DECAY=0.01
 GRADIENT_ACCUMULATION_STEPS=8    # 4 GPU × 8 accum = effective batch 32（与 8-GPU × 4 等效）
 MAX_GRAD_NORM=1.0
-SAVE_EVERY_N_EPOCHS=5
+SAVE_EVERY_N_EPOCHS=1
 DATASET_REPEAT=1
 NUM_FRAMES=81
 HEIGHT=480
