@@ -13,13 +13,13 @@ DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"             
 OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1"
 RESUME_FROM=""             # 断点续训路径（留空从头开始）
 
-NUM_EPOCHS=50
+NUM_EPOCHS=2
 LEARNING_RATE=1e-4         # memory 模块学习率（Stage2 全参时 DiT 用 --lr_dit）
 LR_DIT=1e-5               # Stage2 DiT 学习率
 WEIGHT_DECAY=0.01
 GRADIENT_ACCUMULATION_STEPS=8    # 4 GPU × 8 accum = effective batch 32（与 8-GPU × 4 等效）
 MAX_GRAD_NORM=1.0
-SAVE_EVERY_N_EPOCHS=5
+SAVE_EVERY_N_EPOCHS=2
 DATASET_REPEAT=1
 NUM_FRAMES=81
 HEIGHT=480
