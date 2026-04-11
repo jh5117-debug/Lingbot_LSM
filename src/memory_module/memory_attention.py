@@ -157,8 +157,9 @@ class MemoryCrossAttention(nn.Module):
         out = self.o(out.flatten(2))
 
         # 记录诊断指标（detach 避免影响计算图）
+        # NOTE: 不做 .float() 转换，避免 gradient checkpointing 重计算时产生额外 640MB 显存峰值
         with torch.no_grad():
-            self._last_attn_out_norm = out.float().norm().item()
+            self._last_attn_out_norm = out.detach().norm().item()
             self._last_gate_value = self.gate.item()
         # Gate 缩放：初始化为 0，训练过程中逐渐打开
         return self.gate * out

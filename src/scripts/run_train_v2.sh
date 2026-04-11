@@ -11,9 +11,9 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"                # lingbot-world 预训练权重目录
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"             # CSGO 数据集目录（含 metadata_train.csv）
 OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1"
-RESUME_FROM=""             # 断点续训路径（留空从头开始）
+RESUME_FROM="/home/nvme02/wlx/Memory/outputs/train_v2_stage1/epoch_1"  # 从 epoch1 续训
 
-NUM_EPOCHS=2
+NUM_EPOCHS=1
 LEARNING_RATE=1e-4         # memory 模块学习率（Stage2 全参时 DiT 用 --lr_dit）
 LR_DIT=1e-5               # Stage2 DiT 学习率
 WEIGHT_DECAY=0.01
