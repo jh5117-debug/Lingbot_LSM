@@ -16,7 +16,7 @@ OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
-NUM_EPOCHS=4
+NUM_EPOCHS=2
 LEARNING_RATE=1e-4
 LR_DIT=1e-5
 WEIGHT_DECAY=0.01
