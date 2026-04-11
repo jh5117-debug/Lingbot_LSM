@@ -817,11 +817,11 @@ class LingBotMemoryTrainer:
 # Checkpoint 保存（与 v2 完全对齐）
 # ============================================================
 
-def save_checkpoint(accelerator, model, args, tag: str):
+def save_checkpoint(accelerator, model, args, tag: str, epoch: int = 0, global_step: int = 0):
     """保存 checkpoint。
 
     LoRA 模式：保存 lora_weights.pth（只保存 requires_grad 参数）
-    全参模式：保存 diffusion_pytorch_model.bin（ZeRO-3 集体操作）
+    全参模式：保存 diffusion_pytorch_model.bin（ZeRO-3 集体操作）+ training_state/
 
     与 v2 完全对齐。
     """
@@ -864,6 +864,19 @@ def save_checkpoint(accelerator, model, args, tag: str):
             if n_empty > 0:
                 logging.error(f"WARNING: {n_empty} parameters have empty tensors!")
             del sd
+
+        # 保存完整训练状态（optimizer + scheduler），供续训使用
+        accelerator.save_state(os.path.join(save_dir, "training_state"))
+
+        if accelerator.is_main_process:
+            import json
+            metadata = {"epoch": epoch, "global_step": global_step}
+            with open(os.path.join(save_dir, "training_metadata.json"), "w") as f:
+                json.dump(metadata, f)
+            logging.info(
+                f"Saved training state -> {save_dir}/training_state "
+                f"(epoch={epoch}, global_step={global_step})"
+            )
 
     accelerator.wait_for_everyone()
 
@@ -1053,12 +1066,14 @@ def main():
     )
 
     # ---- Resume（code_standards.md §2：必须支持 --resume）----
+    start_epoch = 0
+    start_global_step = 0
     if args.resume:
         ckpt_file = os.path.join(args.resume, "diffusion_pytorch_model.bin")
+        training_state_dir = os.path.join(args.resume, "training_state")
+        metadata_file = os.path.join(args.resume, "training_metadata.json")
+
         if os.path.exists(ckpt_file):
-            # save_checkpoint 用 save_16bit_model 保存，格式为合并后的 state_dict
-            # accelerator.load_state 期望 Accelerate 原生格式（含 optimizer/scheduler），两者不兼容
-            # 此处直接加载 model weights，optimizer/scheduler 从当前 epoch 初始值重新开始
             state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
             unwrapped = accelerator.unwrap_model(model)
             missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
@@ -1067,14 +1082,23 @@ def main():
             if unexpected:
                 logging.warning(f"Resume: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
             logging.info(f"Resumed model weights from {ckpt_file}")
-        else:
-            accelerator.load_state(args.resume)
-            logging.info(f"Resumed from accelerate checkpoint: {args.resume}")
+
+        if os.path.exists(training_state_dir):
+            accelerator.load_state(training_state_dir)
+            logging.info(f"Resumed optimizer/scheduler from {training_state_dir}")
+
+        if os.path.exists(metadata_file):
+            import json
+            with open(metadata_file) as f:
+                meta = json.load(f)
+            start_epoch = meta.get("epoch", 0) + 1  # +1 因为保存的是已完成的 epoch
+            start_global_step = meta.get("global_step", 0)
+            logging.info(f"Resuming from epoch {start_epoch}, global_step {start_global_step}")
 
     # ---- 训练循环 ----
-    global_step = 0
+    global_step = start_global_step
     try:
-        for epoch in range(args.num_epochs):
+        for epoch in range(start_epoch, args.num_epochs):
             model.train()
             epoch_loss = 0.0
             num_batches = 0
@@ -1135,7 +1159,7 @@ def main():
 
                 # code_standards.md §2：定期保存 checkpoint
                 if args.save_steps and global_step % args.save_steps == 0:
-                    save_checkpoint(accelerator, model, args, f"step_{global_step}")
+                    save_checkpoint(accelerator, model, args, f"step_{global_step}", epoch=epoch, global_step=global_step)
 
                 # dry_run：只跑 2 steps（code_standards.md §2）
                 if args.dry_run and global_step >= 2:
@@ -1153,12 +1177,12 @@ def main():
                 )
 
             if (epoch + 1) % args.save_every_n_epochs == 0:
-                save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}")
+                save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}", epoch=epoch, global_step=global_step)
 
             if args.dry_run:
                 break
 
-        save_checkpoint(accelerator, model, args, "final")
+        save_checkpoint(accelerator, model, args, "final", epoch=args.num_epochs-1, global_step=global_step)
         if accelerator.is_main_process:
             logging.info("Training complete!")
     except Exception as _exc:
