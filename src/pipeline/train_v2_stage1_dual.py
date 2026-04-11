@@ -840,6 +840,8 @@ def save_checkpoint(accelerator, model, args, tag: str):
     else:
         if accelerator.is_main_process:
             os.makedirs(save_dir, exist_ok=True)
+        gc.collect()
+        torch.cuda.empty_cache()
         accelerator.wait_for_everyone()
 
         # ZeRO-3：use DeepSpeed's native save_16bit_model
@@ -1053,8 +1055,19 @@ def main():
 
     # ---- Resume（code_standards.md §2：必须支持 --resume）----
     if args.resume:
-        accelerator.load_state(args.resume)
-        logging.info(f"Resumed from checkpoint: {args.resume}")
+        ckpt_file = os.path.join(args.resume, "diffusion_pytorch_model.bin")
+        if os.path.exists(ckpt_file):
+            state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+            unwrapped = accelerator.unwrap_model(model)
+            missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
+            if missing:
+                logging.warning(f"Resume: missing keys ({len(missing)}): {missing[:5]}")
+            if unexpected:
+                logging.warning(f"Resume: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+            logging.info(f"Resumed model weights from {ckpt_file}")
+        else:
+            accelerator.load_state(args.resume)
+            logging.info(f"Resumed from accelerate checkpoint: {args.resume}")
 
     # ---- 训练循环 ----
     global_step = 0
