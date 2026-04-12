@@ -1101,6 +1101,9 @@ def main():
     try:
         for epoch in range(start_epoch, args.num_epochs):
             model.train()
+            # 清理上一轮 checkpoint save_state() 留下的内存碎片
+            gc.collect()
+            torch.cuda.empty_cache()
             epoch_loss = 0.0
             num_batches = 0
 
@@ -1183,7 +1186,8 @@ def main():
             if args.dry_run:
                 break
 
-        save_checkpoint(accelerator, model, args, "final", epoch=args.num_epochs-1, global_step=global_step)
+        if args.num_epochs % args.save_every_n_epochs != 0:
+            save_checkpoint(accelerator, model, args, "final", epoch=args.num_epochs-1, global_step=global_step)
         if accelerator.is_main_process:
             logging.info("Training complete!")
     except Exception as _exc:

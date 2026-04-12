@@ -10,7 +10,8 @@ set -euo pipefail
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # PENDING[D-03]: 确认后改为 Stage1 输出或 CSGO-DiT 权重
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3_8ch"
-OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v3_stage2_dual"
+OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
+OUTPUT_DIR="${OUTPUT_BASE}/train/v3_stage2_dual"
 RESUME_FROM_LOW=""
 RESUME_FROM_HIGH=""
 
@@ -56,7 +57,7 @@ if [ ! -f "${ACCEL_CONFIG}" ]; then
     echo "[ERROR] accelerate 配置文件不存在：${ACCEL_CONFIG}" >&2; exit 1
 fi
 
-LOG_DIR="${PROJECT_ROOT}/logs/run_train_v3_stage2_dual"
+LOG_DIR="${PROJECT_ROOT}/logs/$(basename "${BASH_SOURCE[0]}" .sh)"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 

@@ -9,7 +9,8 @@ set -euo pipefail
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3_8ch"   # 8ch action 数据集
-OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v3_stage1_dual"
+OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
+OUTPUT_DIR="${OUTPUT_BASE}/train/v3_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
@@ -54,7 +55,7 @@ if [ ! -f "${ACCEL_CONFIG}" ]; then
     echo "[ERROR] accelerate 配置文件不存在：${ACCEL_CONFIG}" >&2; exit 1
 fi
 
-LOG_DIR="${PROJECT_ROOT}/logs/run_train_v3_dual"
+LOG_DIR="${PROJECT_ROOT}/logs/$(basename "${BASH_SOURCE[0]}" .sh)"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 

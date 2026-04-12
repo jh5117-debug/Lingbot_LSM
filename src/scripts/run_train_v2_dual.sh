@@ -12,8 +12,9 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"
-OUTPUT_DIR="/home/nvme02/wlx/Memory/outputs/train_v2_stage1_dual"
-RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
+OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
+OUTPUT_DIR="${OUTPUT_BASE}/train/v2_stage1_dual"
+RESUME_FROM_LOW="${OUTPUT_DIR}/low_noise_model/epoch_1"  # 从 epoch_1 断点续训 epoch_2
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
 NUM_EPOCHS=2
@@ -57,7 +58,7 @@ if [ ! -f "${ACCEL_CONFIG}" ]; then
     echo "[ERROR] accelerate 配置文件不存在：${ACCEL_CONFIG}" >&2; exit 1
 fi
 
-LOG_DIR="${PROJECT_ROOT}/logs/run_train_v2_dual"
+LOG_DIR="${PROJECT_ROOT}/logs/$(basename "${BASH_SOURCE[0]}" .sh)"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 
