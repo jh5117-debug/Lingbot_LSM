@@ -18,6 +18,7 @@ import gc
 import logging
 import math
 import os
+import shutil
 import sys
 import warnings
 from functools import wraps
@@ -1183,6 +1184,14 @@ def main():
 
             if (epoch + 1) % args.save_every_n_epochs == 0:
                 save_checkpoint(accelerator, model, args, f"epoch_{epoch+1}", epoch=epoch, global_step=global_step)
+                # 新 epoch checkpoint 保存成功后，自动删除上一个 epoch 的 training_state
+                if accelerator.is_main_process:
+                    prev_epoch_num = epoch + 1 - args.save_every_n_epochs
+                    if prev_epoch_num >= 1:
+                        prev_state_dir = os.path.join(args.output_dir, f"epoch_{prev_epoch_num}", "training_state")
+                        if os.path.isdir(prev_state_dir):
+                            shutil.rmtree(prev_state_dir)
+                            logging.info(f"Auto-deleted old training_state: {prev_state_dir}")
 
             if args.dry_run:
                 break

@@ -12,7 +12,7 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"
-OUTPUT_BASE="/home/nvme03/wlx/Memory/outputs"
+OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v2_stage1_dual"
 RESUME_FROM_LOW=""          # low_noise_model 已完成（epoch_2），跳过
 RESUME_FROM_HIGH=""         # high 模型断点续训路径（留空从头开始）
