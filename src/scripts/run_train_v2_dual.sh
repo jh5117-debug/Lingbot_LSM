@@ -12,10 +12,10 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"
-OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
+OUTPUT_BASE="/home/nvme03/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v2_stage1_dual"
-RESUME_FROM_LOW="${OUTPUT_DIR}/low_noise_model/epoch_1"  # 从 epoch_1 断点续训 epoch_2
-RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
+RESUME_FROM_LOW=""          # low_noise_model 已完成（epoch_2），跳过
+RESUME_FROM_HIGH=""         # high 模型断点续训路径（留空从头开始）
 
 NUM_EPOCHS=2
 LEARNING_RATE=1e-4
@@ -121,13 +121,11 @@ if [ -n "${RESUME_FROM_LOW}" ]; then
     CMD_LOW+=(--resume "${RESUME_FROM_LOW}")
 fi
 
-echo "执行命令（low）："
-echo "${CMD_LOW[*]}"
-echo ""
-"${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"
-
-echo ""
-echo "===== low_noise_model 训练完成 ====="
+echo "===== low_noise_model 已完成，跳过（epoch_2 checkpoint 已存在）====="
+# echo "执行命令（low）："
+# echo "${CMD_LOW[*]}"
+# echo ""
+# "${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"
 
 # ============================================================
 # Step 2/2: 训练 high_noise_model
