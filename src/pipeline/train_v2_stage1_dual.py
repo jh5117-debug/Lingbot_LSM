@@ -620,7 +620,8 @@ class LingBotMemoryTrainer:
         Ks_repeated = Ks_repeated.to(self.device)
 
         # wasd action（与 v2 完全对齐）
-        wasd = actions[::4].to(self.device)
+        # processed_csgo_v3 使用 8ch action，截断到前 4 维（WASD）以兼容 v2 模型架构
+        wasd = actions[::4, :4].to(self.device)
         if len(wasd) > len(c2ws_infer):
             wasd = wasd[:len(c2ws_infer)]
         elif len(wasd) < len(c2ws_infer):

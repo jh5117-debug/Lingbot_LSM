@@ -226,7 +226,8 @@ def build_dit_cond_dict(
 
     # ---- Step 4: actions 下采样 81 → lat_f 帧（与 camera 插值帧对齐）----
     # 与 prepare_control_signal 中 actions[::4] 完全一致（stride_t=4）
-    wasd = actions[::stride_t]  # [lat_f 或 >=lat_f, 4]
+    # processed_csgo_v3 使用 8ch action，截断到前 4 维（WASD）以兼容 v2 模型架构
+    wasd = actions[::stride_t, :4]  # [lat_f 或 >=lat_f, 4]
     # 长度对齐（截断或末帧填充）
     if len(wasd) > lat_f:
         wasd = wasd[:lat_f]
