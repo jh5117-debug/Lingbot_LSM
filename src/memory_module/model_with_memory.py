@@ -310,6 +310,7 @@ class WanModelWithMemory(WanModel):
         base_model: WanModel,
         memory_layers: Optional[List[int]] = None,
         max_memory_size: int = 8,
+        skip_to_device: bool = False,
     ) -> "WanModelWithMemory":
         """从已加载的预训练 WanModel 转换为 WanModelWithMemory。
 
@@ -320,6 +321,9 @@ class WanModelWithMemory(WanModel):
             base_model:      已加载预训练权重的 WanModel 实例
             memory_layers:   要插入记忆注意力的 block 索引，None = 全部
             max_memory_size: Memory Bank 容量 K
+            skip_to_device:  True 时仅做 dtype 转换（保持 CPU），由调用方负责
+                             搬迁到目标设备。用于大模型转换时避免旧模型未释放
+                             导致 GPU OOM。
 
         Returns:
             WanModelWithMemory 实例，原有权重不变，新增参数随机初始化
@@ -378,8 +382,12 @@ class WanModelWithMemory(WanModel):
             )
 
         # 将新模型移到与 base_model 相同的设备和 dtype（通常 bfloat16）
-        device = next(base_model.parameters()).device
         dtype = next(base_model.parameters()).dtype
-        model = model.to(device=device, dtype=dtype)
+        if skip_to_device:
+            # 仅做 dtype 转换，保持 CPU；调用方负责 del 旧模型后再搬到 GPU
+            model = model.to(dtype=dtype)
+        else:
+            device = next(base_model.parameters()).device
+            model = model.to(device=device, dtype=dtype)
 
         return model

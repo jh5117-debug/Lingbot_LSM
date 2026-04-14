@@ -508,14 +508,27 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
                         提供时加载该目录全量权重到 low_noise_model。
         high_model_dir: ft_high_model_dir 路径，提供时同时转换 high_noise_model 并加载权重。
     """
+    import gc
     from memory_module.model_with_memory import WanModelWithMemory
 
     logger.info("Converting low_noise_model to WanModelWithMemory (max_size=%d)...", memory_max_size)
-    pipeline.low_noise_model = WanModelWithMemory.from_wan_model(
+    # 先在 CPU 建好新模型（skip_to_device=True），避免旧模型未释放时 GPU OOM
+    _low_device = next(pipeline.low_noise_model.parameters()).device
+    _low_dtype  = next(pipeline.low_noise_model.parameters()).dtype
+    _new_low = WanModelWithMemory.from_wan_model(
         pipeline.low_noise_model,
         memory_layers=None,          # 全部 blocks（与 infer.py 默认行为一致）
         max_memory_size=memory_max_size,
+        skip_to_device=True,
     )
+    # 释放旧 GPU 模型后再搬迁新模型
+    del pipeline.low_noise_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    pipeline.low_noise_model = _new_low.to(device=_low_device, dtype=_low_dtype)
+    del _new_low
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # 全参微调模式：从 ft checkpoint 重新加载全量权重（修复 .block. key 不匹配导致的权重丢失）
     if low_model_dir is not None:
@@ -546,11 +559,21 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
             "Converting high_noise_model to WanModelWithMemory (dual mode, max_size=%d)...",
             memory_max_size,
         )
-        pipeline.high_noise_model = WanModelWithMemory.from_wan_model(
+        _high_device = next(pipeline.high_noise_model.parameters()).device
+        _high_dtype  = next(pipeline.high_noise_model.parameters()).dtype
+        _new_high = WanModelWithMemory.from_wan_model(
             pipeline.high_noise_model,
             memory_layers=None,
             max_memory_size=memory_max_size,
+            skip_to_device=True,
         )
+        del pipeline.high_noise_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        pipeline.high_noise_model = _new_high.to(device=_high_device, dtype=_high_dtype)
+        del _new_high
+        gc.collect()
+        torch.cuda.empty_cache()
         _high_state = _load_all_weights_from_hf_checkpoint(high_model_dir)
         if _high_state:
             _result = pipeline.high_noise_model.load_state_dict(_high_state, strict=False)
