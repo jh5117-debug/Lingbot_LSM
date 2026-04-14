@@ -799,7 +799,7 @@ def main():
                     sampling_steps=args.sample_steps,
                     guide_scale=args.guide_scale,
                     seed=42 + clip_idx,
-                    offload_model=False,
+                    offload_model=True,
                 )
             finally:
                 _unpatch_pipeline_memory(wan_i2v)

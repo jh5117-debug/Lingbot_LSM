@@ -376,8 +376,9 @@ class WanModelWithMemory(WanModel):
                 len(missing), missing[:5],
             )
 
-        # 将新模型移到与 base_model 相同的设备
+        # 将新模型移到与 base_model 相同的设备和 dtype（通常 bfloat16）
         device = next(base_model.parameters()).device
-        model = model.to(device)
+        dtype = next(base_model.parameters()).dtype
+        model = model.to(device=device, dtype=dtype)
 
         return model
