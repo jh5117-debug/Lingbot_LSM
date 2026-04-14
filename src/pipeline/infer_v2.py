@@ -245,20 +245,29 @@ def _load_lora_and_prepare_ckpt(args) -> str:
 
 
 def _load_ft_model_and_prepare_ckpt(args) -> str:
-    """全参微调模型：符号链接 ft_model_dir → tmp_dir/low_noise_model，返回 tmp_dir。
+    """全参微调模型：准备 tmp_dir，WanI2V 始终从基础模型加载（避免 .block. key 不匹配警告）。
 
-    与 inference_csgo.py 完全一致。
+    说明：
+      FT checkpoint 由 WanModelWithMemory 训练生成，所有 key 带 .block. 前缀。
+      若直接将 FT 目录 symlink 给 WanI2V，WanModel.from_pretrained 会因 key 不匹配
+      丢弃全部权重并打印大量 "Some weights not used" 警告。
+
+      修复方案：tmp_dir/low_noise_model 和 tmp_dir/high_noise_model 始终指向基础模型，
+      WanI2V 加载干净的基础权重；FT 权重由 _convert_pipeline_to_memory（Step 4）在
+      转换为 WanModelWithMemory 后通过 load_state_dict(strict=False) 正确注入。
     """
     import tempfile
     tmp_dir = tempfile.mkdtemp(prefix='act_')
-    os.symlink(args.ft_model_dir, os.path.join(tmp_dir, "low_noise_model"))
 
-    # high_noise_model: dual 训练时使用 ft_high_model_dir，否则回退到 base ckpt
-    _ft_high = getattr(args, "ft_high_model_dir", None)
-    _high_src = _ft_high if _ft_high else os.path.join(args.ckpt_dir, "high_noise_model")
+    # low_noise_model：始终使用基础模型（FT 权重由 _convert_pipeline_to_memory 注入）
+    _base_low = os.path.join(args.ckpt_dir, "low_noise_model")
+    os.symlink(_base_low, os.path.join(tmp_dir, "low_noise_model"))
+
+    # high_noise_model：始终使用基础模型（FT 权重同样由 _convert_pipeline_to_memory 注入）
+    _base_high = os.path.join(args.ckpt_dir, "high_noise_model")
     _high_dst = os.path.join(tmp_dir, "high_noise_model")
-    if os.path.exists(_high_src) and not os.path.exists(_high_dst):
-        os.symlink(_high_src, _high_dst)
+    if os.path.exists(_base_high) and not os.path.exists(_high_dst):
+        os.symlink(_base_high, _high_dst)
 
     for item in ["Wan2.1_VAE.pth", "models_t5_umt5-xxl-enc-bf16.pth",
                  "google", "configuration.json"]:
