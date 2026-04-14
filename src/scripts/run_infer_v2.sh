@@ -4,19 +4,21 @@ set -euo pipefail
 # ============================================================
 # 用户配置区 — 修改以下变量后运行 bash run_infer_v2.sh
 # ============================================================
-CKPT_DIR=""          # 基础模型目录（必填）
-IMAGE=""             # 初始帧图像路径（.jpg，必填）
-ACTION_PATH=""       # 含 poses.npy / action.npy / intrinsics.npy 的目录（必填）
+CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
+IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR=""          # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
-FT_HIGH_MODEL_DIR=""     # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
+FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/low_noise_model/epoch_1"
+                         # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
+FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/high_noise_model/epoch_1"
+                         # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
                          # FT_HIGH_MODEL_DIR 有值时视为 dual 模式，此时 FT_MODEL_DIR 也必须填写
 
 # Memory Bank（训练出的模型设为 true，baseline 保持 false）
-USE_MEMORY=false
+USE_MEMORY=true
 MEMORY_MAX_SIZE=50
 
 # 推理参数
@@ -25,13 +27,20 @@ NUM_CLIPS=1              # 当前固定 1 个 clip
                          # TODO 多 clip 推理：将 NUM_CLIPS 改为目标数量（如 5），
                          # 并确保 ACTION_PATH 目录内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS，
                          # 同时将 USE_MEMORY=true 以利用 Memory Bank 跨 clip 传递上下文。
-SAMPLE_STEPS=50
+SAMPLE_STEPS=40
 SAMPLE_SHIFT=10.0
 GUIDE_SCALE=5.0
 SIZE="480*832"
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0"
+CUDA_VISIBLE_DEVICES="0,1,2,3"
+
+# 设备分配（两个 14B 模型 + VAE/T5，需要至少 3 张卡）
+LOW_MODEL_DEVICE="cuda:0"
+HIGH_MODEL_DEVICE="cuda:1"
+VAE_DEVICE="cuda:2"
+T5_DEVICE="cuda:2"
+CONVERT_HIGH_TO_MEMORY=true    # 将 high_noise_model 转为 WanModelWithMemory（dual 模式必须为 true）
 
 # ============================================================
 # 以下内容通常无需修改
@@ -61,20 +70,26 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---------- 自动推导实验名 → 输出目录 ----------
 # 规则：
-#   dual  模式（FT_HIGH_MODEL_DIR 非空）: EXP_NAME = 训练 OUTPUT_DIR 的 basename
-#                  e.g. .../train/v2_stage1_dual/low_noise_model/epoch_2 → v2_stage1_dual
-#   single 模式（只有 FT_MODEL_DIR）     : EXP_NAME = 训练 OUTPUT_DIR 的 basename
-#                  e.g. .../train/v2_stage1/epoch_2                      → v2_stage1
+#   dual  模式（FT_HIGH_MODEL_DIR 非空）: EXP_NAME = <训练dir>_<epoch>
+#                  e.g. .../train/v2_stage1_dual/low_noise_model/epoch_1 → v2_stage1_dual_epoch_1
+#   single 模式（只有 FT_MODEL_DIR）     : EXP_NAME = <训练dir>_<epoch>
+#                  e.g. .../train/v2_stage1/epoch_2                      → v2_stage1_epoch_2
 #   baseline（均为空）                  : EXP_NAME = baseline
 if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
-    EXP_NAME="$(basename "$(dirname "$(dirname "${FT_MODEL_DIR}")")")"
+    _train_dir="$(basename "$(dirname "$(dirname "${FT_MODEL_DIR}")")")"
+    _epoch="$(basename "${FT_MODEL_DIR}")"
+    EXP_NAME="${_train_dir}_${_epoch}"
 elif [ -n "${FT_MODEL_DIR}" ]; then
-    EXP_NAME="$(basename "$(dirname "${FT_MODEL_DIR}")")"
+    _train_dir="$(basename "$(dirname "${FT_MODEL_DIR}")")"
+    _epoch="$(basename "${FT_MODEL_DIR}")"
+    EXP_NAME="${_train_dir}_${_epoch}"
 else
     EXP_NAME="baseline"
 fi
 
-SAVE_FILE="${OUTPUT_BASE}/inference/${EXP_NAME}/output_$(date +%Y%m%d_%H%M%S).mp4"
+# clip 名称取自 ACTION_PATH 目录名，便于 baseline vs 微调结果直接对比
+CLIP_NAME="$(basename "${ACTION_PATH}")"
+SAVE_FILE="${OUTPUT_BASE}/inference/${EXP_NAME}/${CLIP_NAME}.mp4"
 
 # ---------- 日志目录 & 日志文件 ----------
 LOG_DIR="${PROJECT_ROOT}/logs/$(basename "${BASH_SOURCE[0]}" .sh)"
@@ -86,6 +101,7 @@ mkdir -p "$(dirname "${SAVE_FILE}")"
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 推理 v2 启动"
 echo "  EXP_NAME   : ${EXP_NAME}"
+echo "  CLIP_NAME  : ${CLIP_NAME}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  CKPT_DIR   : ${CKPT_DIR}"
 echo "  IMAGE      : ${IMAGE}"
@@ -98,18 +114,22 @@ echo "====================================================="
 # ---------- 拼接推理命令 ----------
 CMD=(
     python "${PROJECT_ROOT}/src/pipeline/infer_v2.py"
-    --ckpt_dir        "${CKPT_DIR}"
-    --image           "${IMAGE}"
-    --action_path     "${ACTION_PATH}"
-    --save_file       "${SAVE_FILE}"
-    --prompt          "${PROMPT}"
-    --frame_num       "${FRAME_NUM}"
-    --num_clips       "${NUM_CLIPS}"
-    --sample_steps    "${SAMPLE_STEPS}"
-    --sample_shift    "${SAMPLE_SHIFT}"
-    --guide_scale     "${GUIDE_SCALE}"
-    --size            "${SIZE}"
-    --memory_max_size "${MEMORY_MAX_SIZE}"
+    --ckpt_dir           "${CKPT_DIR}"
+    --image              "${IMAGE}"
+    --action_path        "${ACTION_PATH}"
+    --save_file          "${SAVE_FILE}"
+    --prompt             "${PROMPT}"
+    --frame_num          "${FRAME_NUM}"
+    --num_clips          "${NUM_CLIPS}"
+    --sample_steps       "${SAMPLE_STEPS}"
+    --sample_shift       "${SAMPLE_SHIFT}"
+    --guide_scale        "${GUIDE_SCALE}"
+    --size               "${SIZE}"
+    --memory_max_size    "${MEMORY_MAX_SIZE}"
+    --low_model_device   "${LOW_MODEL_DEVICE}"
+    --high_model_device  "${HIGH_MODEL_DEVICE}"
+    --vae_device         "${VAE_DEVICE}"
+    --t5_device          "${T5_DEVICE}"
 )
 
 # 可选：LoRA 权重
@@ -128,6 +148,11 @@ fi
 # 可选：启用 Memory Bank
 if [ "${USE_MEMORY}" = "true" ]; then
     CMD+=(--use_memory)
+fi
+
+# 可选：将 high_noise_model 转为 WanModelWithMemory（dual 模式下必须为 true）
+if [ "${CONVERT_HIGH_TO_MEMORY}" = "true" ]; then
+    CMD+=(--convert_high_to_memory)
 fi
 
 echo "执行命令："
