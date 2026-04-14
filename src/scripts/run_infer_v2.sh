@@ -11,9 +11,9 @@ PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR=""          # 全参微调 / dual-low  目录（如 .../train_v2_stage1/final）
-FT_HIGH_MODEL_DIR=""     # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/final）
-                         # FT_HIGH_MODEL_DIR 有值时视为 dual 模式
+FT_MODEL_DIR=""          # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
+FT_HIGH_MODEL_DIR=""     # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
+                         # FT_HIGH_MODEL_DIR 有值时视为 dual 模式，此时 FT_MODEL_DIR 也必须填写
 
 # Memory Bank（训练出的模型设为 true，baseline 保持 false）
 USE_MEMORY=false
@@ -44,6 +44,15 @@ _err=0
 if [ -z "${CKPT_DIR}" ];    then echo "[ERROR] CKPT_DIR 未设置"    >&2; _err=1; fi
 if [ -z "${IMAGE}" ];       then echo "[ERROR] IMAGE 未设置"        >&2; _err=1; fi
 if [ -z "${ACTION_PATH}" ]; then echo "[ERROR] ACTION_PATH 未设置"  >&2; _err=1; fi
+# dual 模式：FT_HIGH_MODEL_DIR 非空时 FT_MODEL_DIR 也必须填写
+if [ -n "${FT_HIGH_MODEL_DIR}" ] && [ -z "${FT_MODEL_DIR}" ]; then
+    echo "[ERROR] dual 模式下 FT_MODEL_DIR 未设置（FT_HIGH_MODEL_DIR 有值时必须同时填写 FT_MODEL_DIR）" >&2; _err=1
+fi
+# 使用训练权重但未启用 Memory Bank 时给出提示
+if { [ -n "${FT_MODEL_DIR}" ] || [ -n "${FT_HIGH_MODEL_DIR}" ] || [ -n "${LORA_PATH}" ]; } \
+        && [ "${USE_MEMORY}" != "true" ]; then
+    echo "[WARN] 检测到微调权重但 USE_MEMORY=false，Memory Bank 未启用；如需使用请将 USE_MEMORY 设为 true" >&2
+fi
 if [ "${_err}" -ne 0 ]; then exit 1; fi
 
 # ---------- 路径计算 ----------
@@ -53,9 +62,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # ---------- 自动推导实验名 → 输出目录 ----------
 # 规则：
 #   dual  模式（FT_HIGH_MODEL_DIR 非空）: EXP_NAME = 训练 OUTPUT_DIR 的 basename
-#                  e.g. .../train_v2_stage1_dual/low_noise_model/final → train_v2_stage1_dual
+#                  e.g. .../train/v2_stage1_dual/low_noise_model/epoch_2 → v2_stage1_dual
 #   single 模式（只有 FT_MODEL_DIR）     : EXP_NAME = 训练 OUTPUT_DIR 的 basename
-#                  e.g. .../train_v2_stage1/final                      → train_v2_stage1
+#                  e.g. .../train/v2_stage1/epoch_2                      → v2_stage1
 #   baseline（均为空）                  : EXP_NAME = baseline
 if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
     EXP_NAME="$(basename "$(dirname "$(dirname "${FT_MODEL_DIR}")")")"
