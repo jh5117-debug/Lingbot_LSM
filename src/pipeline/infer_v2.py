@@ -518,6 +518,14 @@ def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
     frame_embs = None
     if c2ws_plucker_emb is not None and isinstance(model, WanModelWithMemory):
         with torch.no_grad():
+            # FIX: offload_model=True 时这些嵌入层可能已被卸载到 CPU；
+            # 临时移到 device 执行计算（这几个层很小，移动开销可忽略）
+            _pose_emb_layers = ['patch_embedding_wancamctrl',
+                                'c2ws_hidden_states_layer1',
+                                'c2ws_hidden_states_layer2']
+            for _attr in _pose_emb_layers:
+                if hasattr(model, _attr):
+                    getattr(model, _attr).to(device)
             frame_embs = model.get_projected_frame_embs(
                 c2ws_plucker_emb.to(device)
             )  # [lat_f, dim=5120]
@@ -538,6 +546,8 @@ def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
     clip_surprise = None
     if last_hidden_states is not None and hasattr(model, 'nfp_head') and model.nfp_head is not None:
         with torch.no_grad():
+            # FIX: offload_model=True 时 nfp_head 可能已在 CPU
+            model.nfp_head.to(device)
             _hs = last_hidden_states.to(device).to(
                 next(model.nfp_head.parameters()).dtype
             )  # [1, L, 5120]
@@ -553,6 +563,8 @@ def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
     visual_embs = None
     if isinstance(model, WanModelWithMemory) and hasattr(model, 'latent_proj'):
         with torch.no_grad():
+            # FIX: offload_model=True 时 latent_proj 可能已在 CPU
+            model.latent_proj.to(device)
             visual_embs = []
             for t_idx in range(lat_f):
                 v_emb = model.get_projected_latent_emb(
