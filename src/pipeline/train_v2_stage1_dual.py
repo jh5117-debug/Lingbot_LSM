@@ -866,6 +866,11 @@ def save_checkpoint(accelerator, model, args, tag: str, epoch: int = 0, global_s
 
         # 保存完整训练状态（optimizer + scheduler），供续训使用
         accelerator.save_state(os.path.join(save_dir, "training_state"))
+        # ZeRO-3 save_state() re-assembles all shards/optimizer moments; release
+        # that residual memory before returning so the next training step does
+        # not OOM (observed: GPUs nearly full at the first step of epoch N+1).
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if accelerator.is_main_process:
             import json
