@@ -35,12 +35,6 @@ SIZE="480*832"
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
 CUDA_VISIBLE_DEVICES="0,1,2,3"
 
-# 设备分配（两个 14B 模型 + VAE/T5，需要至少 3 张卡）
-LOW_MODEL_DEVICE="cuda:0"
-HIGH_MODEL_DEVICE="cuda:1"
-VAE_DEVICE="cuda:2"
-T5_DEVICE="cuda:2"
-CONVERT_HIGH_TO_MEMORY=true    # 将 high_noise_model 转为 WanModelWithMemory（dual 模式必须为 true）
 
 # ============================================================
 # 以下内容通常无需修改
@@ -126,10 +120,6 @@ CMD=(
     --guide_scale        "${GUIDE_SCALE}"
     --size               "${SIZE}"
     --memory_max_size    "${MEMORY_MAX_SIZE}"
-    --low_model_device   "${LOW_MODEL_DEVICE}"
-    --high_model_device  "${HIGH_MODEL_DEVICE}"
-    --vae_device         "${VAE_DEVICE}"
-    --t5_device          "${T5_DEVICE}"
 )
 
 # 可选：LoRA 权重
@@ -150,10 +140,6 @@ if [ "${USE_MEMORY}" = "true" ]; then
     CMD+=(--use_memory)
 fi
 
-# 可选：将 high_noise_model 转为 WanModelWithMemory（dual 模式下必须为 true）
-if [ "${CONVERT_HIGH_TO_MEMORY}" = "true" ]; then
-    CMD+=(--convert_high_to_memory)
-fi
 
 echo "执行命令："
 echo "${CMD[*]}"
