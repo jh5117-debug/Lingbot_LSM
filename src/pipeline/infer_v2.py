@@ -69,6 +69,160 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Ulysses SP + Memory 联合推理支持
+# ---------------------------------------------------------------------------
+
+# 用于 SP 模式下在模型属性上传递 memory states（替代 forward 替换）
+_SP_MEM_STATES_ATTR = '_sp_memory_states'
+_SP_MEM_VAL_ATTR    = '_sp_memory_value_states'
+
+
+def _sp_dit_forward_with_memory(self, x, t, context, seq_len, y=None, dit_cond_dict=None):
+    """WanModelWithMemory + Ulysses SP 联合 forward。
+
+    读取 self._sp_memory_states / self._sp_memory_value_states（由 _patch_pipeline_memory 设置），
+    将其注入 dit_cond_dict，然后按 sp_dit_forward 的逻辑进行序列并行推理。
+
+    与原版 sp_dit_forward 的区别：先注入 memory，再做 SP 分割和 block 调用。
+    blocks 是 MemoryBlockWrapper，其内层 self_attn.forward 已被 sp_attn_forward 替换。
+    """
+    import torch.nn.functional as torch_F
+    from wan.distributed.util import get_rank, get_world_size, gather_forward
+    from wan.modules.model import sinusoidal_embedding_1d
+    from einops import rearrange
+    # 延迟导入，避免循环依赖
+    from memory_module.model_with_memory import _MEMORY_STATES_KEY, _MEMORY_VALUE_KEY
+
+    # ---- Step 1: 注入 memory states ----
+    _mem_states = getattr(self, _SP_MEM_STATES_ATTR, None)
+    _mem_val    = getattr(self, _SP_MEM_VAL_ATTR,    None)
+    if _mem_states is not None:
+        if dit_cond_dict is None:
+            dit_cond_dict = {}
+        else:
+            dit_cond_dict = dict(dit_cond_dict)
+        _dev = self.patch_embedding.weight.device
+        dit_cond_dict[_MEMORY_STATES_KEY] = _mem_states.to(_dev)
+        if _mem_val is not None:
+            dit_cond_dict[_MEMORY_VALUE_KEY] = _mem_val.to(_dev)
+
+    # ---- Step 2: sp_dit_forward 逻辑（与原版完全一致）----
+    if self.model_type == 'i2v':
+        assert y is not None
+    device = self.patch_embedding.weight.device
+    if self.freqs.device != device:
+        self.freqs = self.freqs.to(device)
+
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+    grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+    x = [u.flatten(2).transpose(1, 2) for u in x]
+    seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+    assert seq_lens.max() <= seq_len
+    x = torch.cat([
+        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+        for u in x
+    ])
+
+    if t.dim() == 1:
+        t = t.expand(t.size(0), seq_len)
+    with torch.amp.autocast('cuda', dtype=torch.float32):
+        bt = t.size(0)
+        t = t.flatten()
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len)).float())
+        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+    context_lens = None
+    context = self.text_embedding(
+        torch.stack([
+            torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+            for u in context
+        ]))
+
+    if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+        c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
+        c2ws_plucker_emb = [
+            rearrange(
+                i, '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
+                c1=self.patch_size[0], c2=self.patch_size[1], c3=self.patch_size[2],
+            ) for i in c2ws_plucker_emb
+        ]
+        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)
+        c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
+        c2ws_hidden = self.c2ws_hidden_states_layer2(
+            torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
+        c2ws_plucker_emb = c2ws_plucker_emb + c2ws_hidden
+        cam_len = c2ws_plucker_emb.size(1)
+        if cam_len < seq_len:
+            pad = c2ws_plucker_emb.new_zeros(
+                c2ws_plucker_emb.size(0), seq_len - cam_len, c2ws_plucker_emb.size(2))
+            c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, pad], dim=1)
+        elif cam_len > seq_len:
+            c2ws_plucker_emb = c2ws_plucker_emb[:, :seq_len, :]
+        if get_world_size() > 1:
+            c2ws_plucker_emb = torch.chunk(c2ws_plucker_emb, get_world_size(), dim=1)[get_rank()]
+        dit_cond_dict = dict(dit_cond_dict)
+        dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb
+
+    x  = torch.chunk(x,  get_world_size(), dim=1)[get_rank()]
+    e  = torch.chunk(e,  get_world_size(), dim=1)[get_rank()]
+    e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
+
+    kwargs = dict(
+        e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=self.freqs,
+        context=context, context_lens=context_lens, dit_cond_dict=dit_cond_dict)
+
+    for block in self.blocks:
+        x = block(x, **kwargs)
+
+    x = self.head(x, e)
+    x = gather_forward(x, dim=1)
+    x = self.unpatchify(x, grid_sizes)
+    return [u.float() for u in x]
+
+
+def _configure_memory_model_for_dist(model, use_sp: bool, device):
+    """为 WanModelWithMemory 应用 Ulysses SP（不使用 FSDP，权重在各卡复制）。
+
+    必须在 _convert_pipeline_to_memory 之后调用，此时 model.blocks 已是
+    MemoryBlockWrapper 列表，内层 self_attn 在 block.block.self_attn。
+
+    Args:
+        model:   WanModelWithMemory 实例
+        use_sp:  是否启用 Ulysses 序列并行
+        device:  目标设备（cuda:local_rank）
+    """
+    import types
+    from memory_module.model_with_memory import MemoryBlockWrapper
+    from wan.distributed.sequence_parallel import sp_attn_forward
+
+    model.eval().requires_grad_(False)
+
+    if use_sp:
+        # 为每个 MemoryBlockWrapper 内部 block 的 self_attn 打补丁
+        for block in model.blocks:
+            if isinstance(block, MemoryBlockWrapper):
+                inner_attn = block.block.self_attn
+            else:
+                inner_attn = block.self_attn  # 兼容未被 wrap 的普通 block
+            inner_attn.forward = types.MethodType(sp_attn_forward, inner_attn)
+
+        # 替换 model.forward 为 SP + memory 联合版本
+        model.forward = types.MethodType(_sp_dit_forward_with_memory, model)
+
+        # 初始化 memory state 属性（_patch_pipeline_memory 会按 clip 覆盖）
+        setattr(model, _SP_MEM_STATES_ATTR, None)
+        setattr(model, _SP_MEM_VAL_ATTR,    None)
+
+    model.to(device)
+    return model
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -417,15 +571,11 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
 
 
 def _patch_pipeline_memory(pipeline, memory_states, memory_value_states=None):
-    """将 memory_states / memory_value_states 通过 monkey-patch 注入到 pipeline low_noise_model 的 forward 中。
+    """将 memory_states / memory_value_states 注入 pipeline 的模型 forward 中。
 
-    MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
-    新增 memory_value_states 参数（visual_emb），作为 cross-attention 的 V。
-
-    注意：默认只 patch low_noise_model。若 high_noise_model 已转换为 WanModelWithMemory
-    （dual 推理模式，通过 --ft_high_model_dir 启用），则同时 patch high_noise_model，
-    两个模型共享同一份 memory_states / memory_value_states（来自同一 MemoryBank）。
-    复用 infer.py 的 _patch_pipeline_memory 逻辑（FIX[B-01]：使用 functools.partial）。
+    SP 模式（model 有 _sp_memory_states 属性）：直接设置属性，
+    _sp_dit_forward_with_memory 在 forward 时读取。
+    非 SP 模式：monkey-patch model.forward（原有行为）。
     """
     if memory_states is None:
         return
@@ -433,43 +583,47 @@ def _patch_pipeline_memory(pipeline, memory_states, memory_value_states=None):
     import functools
     from memory_module.model_with_memory import WanModelWithMemory
 
-    def _make_patched(m, mem, mem_val):
-        @functools.wraps(m.forward)
-        def _patched(x, t, context, seq_len, y=None, dit_cond_dict=None):
-            _dev = next(m.parameters()).device
-            _mem_val = mem_val.to(_dev) if mem_val is not None else None
-            return WanModelWithMemory.forward(
-                m, x, t, context, seq_len,
-                y=y, dit_cond_dict=dit_cond_dict,
-                memory_states=mem.to(_dev),
-                memory_value_states=_mem_val,  # MODIFIED: F-03/F5 fix
-            )
-        return _patched
+    def _apply(m, mem, mem_val):
+        if not isinstance(m, WanModelWithMemory):
+            return
+        if hasattr(m, _SP_MEM_STATES_ATTR):
+            # SP 模式：通过属性注入，不替换 forward
+            setattr(m, _SP_MEM_STATES_ATTR, mem)
+            setattr(m, _SP_MEM_VAL_ATTR,    mem_val)
+        else:
+            # 非 SP 模式：替换 forward（原有行为）
+            def _make_patched(model, _mem, _mem_val):
+                @functools.wraps(model.forward)
+                def _patched(x, t, context, seq_len, y=None, dit_cond_dict=None):
+                    _dev = next(model.parameters()).device
+                    _mv  = _mem_val.to(_dev) if _mem_val is not None else None
+                    return WanModelWithMemory.forward(
+                        model, x, t, context, seq_len,
+                        y=y, dit_cond_dict=dit_cond_dict,
+                        memory_states=_mem.to(_dev),
+                        memory_value_states=_mv,
+                    )
+                return _patched
+            m._original_forward = m.forward
+            m.forward = _make_patched(m, mem, mem_val)
 
-    model = pipeline.low_noise_model
-    if isinstance(model, WanModelWithMemory):
-        model._original_forward = model.forward
-        model.forward = _make_patched(model, memory_states, memory_value_states)
-
-    # dual 模型支持：若 high_noise_model 也是 WanModelWithMemory，同样注入 memory
-    high_model = pipeline.high_noise_model
-    if isinstance(high_model, WanModelWithMemory):
-        high_model._original_forward = high_model.forward
-        high_model.forward = _make_patched(high_model, memory_states, memory_value_states)
+    _apply(pipeline.low_noise_model,  memory_states, memory_value_states)
+    _apply(pipeline.high_noise_model, memory_states, memory_value_states)
 
 
 def _unpatch_pipeline_memory(pipeline):
-    """还原 _patch_pipeline_memory 的 monkey-patch（low_noise_model，以及 dual 模式下的 high_noise_model）。"""
-    model = pipeline.low_noise_model
-    if hasattr(model, '_original_forward'):
-        model.forward = model._original_forward
-        del model._original_forward
+    """还原 _patch_pipeline_memory 的注入（low_noise_model 和 high_noise_model）。"""
+    def _restore(m):
+        if hasattr(m, _SP_MEM_STATES_ATTR):
+            # SP 模式：清空属性
+            setattr(m, _SP_MEM_STATES_ATTR, None)
+            setattr(m, _SP_MEM_VAL_ATTR,    None)
+        elif hasattr(m, '_original_forward'):
+            m.forward = m._original_forward
+            del m._original_forward
 
-    # dual 模型支持：同时还原 high_noise_model 的 patch（若有）
-    high_model = pipeline.high_noise_model
-    if hasattr(high_model, '_original_forward'):
-        high_model.forward = high_model._original_forward
-        del high_model._original_forward
+    _restore(pipeline.low_noise_model)
+    _restore(pipeline.high_noise_model)
 
 
 def _update_memory_bank(bank, video, pipeline, device, clip_start_frame: int,
@@ -634,8 +788,21 @@ def main():
     if args.ulysses_size > 1:
         init_distributed_group()
 
-    # ---- Step 3：加载 WanI2V 管道（与 inference_csgo.py 完全一致）----
+    # ---- Step 3：加载 WanI2V 管道 ----
     cfg = WAN_CONFIGS["i2v-A14B"]
+
+    # SP 模式下，当 use_memory=True，延迟到 _convert_pipeline_to_memory 之后手动应用；
+    # 否则直接传给 WanI2V（与 inference_csgo.py 原有行为一致）。
+    _use_sp   = args.ulysses_size > 1
+    _use_fsdp = args.dit_fsdp
+    if args.use_memory and _use_sp:
+        # 避免 WanI2V._configure_model 对原始 WanModel 的 block 打 SP 补丁；
+        # MemoryBlockWrapper 转换后再手动应用（见 Step 4）
+        _wan_use_sp   = False
+        _wan_dit_fsdp = False
+    else:
+        _wan_use_sp   = _use_sp
+        _wan_dit_fsdp = _use_fsdp
 
     wan_i2v = WanI2V(
         config=cfg,
@@ -643,9 +810,11 @@ def main():
         device_id=local_rank,
         rank=rank,
         t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp,
-        use_sp=(args.ulysses_size > 1),
+        dit_fsdp=_wan_dit_fsdp,
+        use_sp=_wan_use_sp,
     )
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     # ---- Step 4：Memory 初始化（新增，仅当 --use_memory 时）----
     memory_bank = None
@@ -664,13 +833,24 @@ def main():
             high_model_dir=args.ft_high_model_dir,  # dual 模型支持
             low_model_dir=args.ft_model_dir,        # 修复 .block. key 不匹配导致的全量权重丢失
         )
+
+        # 在转换为 WanModelWithMemory 之后，手动应用 Ulysses SP
+        if _use_sp:
+            from memory_module.model_with_memory import WanModelWithMemory as _WMM
+            logger.info("Applying Ulysses SP to WanModelWithMemory (use_sp=True, world_size=%d)", world_size)
+            if isinstance(wan_i2v.low_noise_model, _WMM):
+                wan_i2v.low_noise_model = _configure_memory_model_for_dist(
+                    wan_i2v.low_noise_model, use_sp=True, device=device)
+            if isinstance(wan_i2v.high_noise_model, _WMM):
+                wan_i2v.high_noise_model = _configure_memory_model_for_dist(
+                    wan_i2v.high_noise_model, use_sp=True, device=device)
+
         memory_bank = MemoryBank(max_size=args.memory_max_size)
         logger.info("MemoryBank created: %s", memory_bank)
 
     # ---- Step 5：加载图像，生成视频 ----
     img = Image.open(args.image).convert("RGB")
     max_area = MAX_AREA_CONFIGS[args.size]
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if args.use_memory and memory_bank is not None:
         from memory_module.model_with_memory import WanModelWithMemory

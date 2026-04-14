@@ -256,7 +256,8 @@ class WanModelWithMemory(WanModel):
             visual_emb: [dim=5120]  VAE latent 投影到模型空间的视觉嵌入
         """
         # 空间均值池化：[z_dim, lat_h, lat_w] → [z_dim]
-        feat = latent.float().mean(dim=[-2, -1])  # [z_dim=16]
+        # Cast to match latent_proj weight dtype (e.g. bfloat16) to avoid dtype mismatch
+        feat = latent.to(self.latent_proj.weight.dtype).mean(dim=[-2, -1])  # [z_dim=16]
         # 线性投影：[z_dim=16] → [dim=5120]
         return self.latent_proj(feat)  # [dim=5120]
 

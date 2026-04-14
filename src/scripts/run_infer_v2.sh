@@ -42,6 +42,9 @@ CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 export CUDA_VISIBLE_DEVICES
 
+# ---------- GPU 计数 ----------
+NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
+
 # ---------- 路径检查 ----------
 _err=0
 if [ -z "${CKPT_DIR}" ];    then echo "[ERROR] CKPT_DIR 未设置"    >&2; _err=1; fi
@@ -141,8 +144,25 @@ if [ "${USE_MEMORY}" = "true" ]; then
 fi
 
 
+# ---------- 启动方式：多卡 Memory 模式用 torchrun，其余用 python ----------
+if [ "${USE_MEMORY}" = "true" ] && [ "${NUM_GPUS}" -gt 1 ]; then
+    CMD+=(--ulysses_size "${NUM_GPUS}")
+    CMD+=(--t5_fsdp)          # 多卡时对 T5 做 FSDP 分片，避免每卡复制全量 T5（~22 GiB）
+    # 替换脚本中第一个元素 python → torchrun
+    LAUNCH=(
+        torchrun
+        --nproc_per_node "${NUM_GPUS}"
+        --master_port 29500
+    )
+    # CMD 第一个元素是 "python"，第二个是脚本路径
+    # 重新构造：去掉 python，用 torchrun + 脚本路径
+    FULL_CMD=("${LAUNCH[@]}" "${CMD[@]:1}")
+else
+    FULL_CMD=("${CMD[@]}")
+fi
+
 echo "执行命令："
-echo "${CMD[*]}"
+echo "${FULL_CMD[*]}"
 echo ""
 
-"${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
+"${FULL_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
