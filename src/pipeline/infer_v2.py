@@ -273,13 +273,8 @@ def _load_ft_model_and_prepare_ckpt(args) -> str:
 # Memory 辅助（复用 infer.py 中的逻辑）
 # ---------------------------------------------------------------------------
 
-def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
-    """从 HuggingFace 格式 checkpoint 中提取 memory module 权重。
-
-    WanModelWithMemory.save_pretrained() 将所有权重（含 memory modules）保存为
-    safetensors 或 pytorch_model*.bin。WanModel.from_pretrained() 加载时忽略 memory
-    相关 key（unexpected_keys）；本函数提取这些被忽略的权重，供 load_state_dict(strict=False) 使用。
-    """
+def _load_all_weights_from_hf_checkpoint(model_dir: str) -> dict:
+    """从 HuggingFace 格式 checkpoint 中加载所有权重（safetensors 优先，回退 .bin）。"""
     import glob
     state = {}
     sf_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
@@ -294,7 +289,19 @@ def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
         bin_files = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin")))
         for f in bin_files:
             state.update(torch.load(f, map_location="cpu", weights_only=True))
+    logger.info(
+        "_load_all_weights_from_hf_checkpoint: loaded %d keys from %s",
+        len(state), model_dir,
+    )
+    return state
 
+
+def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
+    """从 HuggingFace 格式 checkpoint 中提取 memory module 权重（已废弃，内部改用 _load_all_weights）。
+
+    保留此函数以兼容外部调用。
+    """
+    state = _load_all_weights_from_hf_checkpoint(model_dir)
     memory_state = {k: v for k, v in state.items()
                     if any(pat in k for pat in _MEMORY_KEY_PATTERNS)}
     logger.info(
@@ -304,12 +311,21 @@ def _load_memory_weights_from_hf_checkpoint(model_dir: str) -> dict:
     return memory_state
 
 
-def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path=None, high_model_dir=None):
-    """将 WanI2V 管道的 low_noise_model 替换为 WanModelWithMemory。
+def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path=None,
+                                 high_model_dir=None, low_model_dir=None):
+    """将 WanI2V 管道的 low_noise_model 替换为 WanModelWithMemory，并加载微调权重。
 
-    默认只转换 low_noise_model。若提供 high_model_dir（来自 --ft_high_model_dir，
-    对应 train_v2_stage1_dual.py 的 high_noise_model 输出），则同时将 high_noise_model
-    转换为 WanModelWithMemory 并加载对应 memory 权重（dual 推理模式）。
+    背景：WanModelWithMemory 将 WanAttentionBlock 包裹在 MemoryBlockWrapper.block 下，
+    导致所有 checkpoint key 带有 .block. 前缀（如 blocks.N.block.self_attn.q.weight），
+    与 WanModel.from_pretrained 期待的 blocks.N.self_attn.q.weight 不匹配。
+    因此 WanI2V 初始化时会丢弃所有微调权重（含 cam_injector、memory 等）。
+    本函数在转换为 WanModelWithMemory 后（key 结构与 checkpoint 完全吻合），
+    通过 load_state_dict(strict=False) 重新加载全量微调权重来修正这一问题。
+
+    参数：
+        low_model_dir:  ft_model_dir 路径（如 .../low_noise_model/epoch_1），
+                        提供时加载该目录全量权重到 low_noise_model。
+        high_model_dir: ft_high_model_dir 路径，提供时同时转换 high_noise_model 并加载权重。
     """
     from memory_module.model_with_memory import WanModelWithMemory
 
@@ -319,9 +335,22 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
         memory_layers=None,          # 全部 blocks（与 infer.py 默认行为一致）
         max_memory_size=memory_max_size,
     )
-    # high_noise_model 保持原始 WanModel，不做转换（见函数注释）
+
+    # 全参微调模式：从 ft checkpoint 重新加载全量权重（修复 .block. key 不匹配导致的权重丢失）
+    if low_model_dir is not None:
+        _low_state = _load_all_weights_from_hf_checkpoint(low_model_dir)
+        if _low_state:
+            _result = pipeline.low_noise_model.load_state_dict(_low_state, strict=False)
+            logger.info(
+                "Reloaded %d ft weights for low_noise_model from %s (missing=%d, unexpected=%d)",
+                len(_low_state), low_model_dir,
+                len(_result.missing_keys), len(_result.unexpected_keys),
+            )
+        else:
+            logger.warning("No weights found in low_model_dir=%s", low_model_dir)
 
     # V5-B2-01 fix: LoRA 推理时 gate/nfp_head/latent_proj 已被单独保存，从此处加载
+    # （full-param 模式下 low_model_dir 已覆盖，此分支仅供 LoRA 模式使用）
     if memory_ckpt_path is not None and os.path.exists(memory_ckpt_path):
         _mem_state = torch.load(memory_ckpt_path, map_location="cpu", weights_only=True)
         _result = pipeline.low_noise_model.load_state_dict(_mem_state, strict=False)
@@ -330,7 +359,7 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
             len(_mem_state), memory_ckpt_path, len(_result.missing_keys),
         )
 
-    # dual 模型支持：若 high_model_dir 提供，同时对 high_noise_model 做 WanModelWithMemory 转换
+    # dual 模型支持：若 high_model_dir 提供，同时转换 high_noise_model 并加载全量权重
     if high_model_dir is not None:
         logger.info(
             "Converting high_noise_model to WanModelWithMemory (dual mode, max_size=%d)...",
@@ -341,17 +370,18 @@ def _convert_pipeline_to_memory(pipeline, memory_max_size: int, memory_ckpt_path
             memory_layers=None,
             max_memory_size=memory_max_size,
         )
-        _high_mem_state = _load_memory_weights_from_hf_checkpoint(high_model_dir)
-        if _high_mem_state:
-            _result = pipeline.high_noise_model.load_state_dict(_high_mem_state, strict=False)
+        _high_state = _load_all_weights_from_hf_checkpoint(high_model_dir)
+        if _high_state:
+            _result = pipeline.high_noise_model.load_state_dict(_high_state, strict=False)
             logger.info(
-                "Loaded %d memory weights for high_noise_model (missing=%d)",
-                len(_high_mem_state), len(_result.missing_keys),
+                "Reloaded %d ft weights for high_noise_model from %s (missing=%d, unexpected=%d)",
+                len(_high_state), high_model_dir,
+                len(_result.missing_keys), len(_result.unexpected_keys),
             )
         else:
             logger.warning(
-                "No memory weights found in high_model_dir=%s; "
-                "high_noise_model memory modules start from scratch.",
+                "No weights found in high_model_dir=%s; "
+                "high_noise_model starts from base weights.",
                 high_model_dir,
             )
 
@@ -591,8 +621,9 @@ def main():
         wan_i2v = _convert_pipeline_to_memory(
             wan_i2v,
             memory_max_size=args.memory_max_size,
-            memory_ckpt_path=_memory_ckpt_path,  # V5-B2-01 fix: LoRA 模式下加载训练好的 memory 权重
-            high_model_dir=args.ft_high_model_dir,   # NEW: dual 模型支持
+            memory_ckpt_path=_memory_ckpt_path,    # V5-B2-01 fix: LoRA 模式下加载训练好的 memory 权重
+            high_model_dir=args.ft_high_model_dir,  # dual 模型支持
+            low_model_dir=args.ft_model_dir,        # 修复 .block. key 不匹配导致的全量权重丢失
         )
         memory_bank = MemoryBank(max_size=args.memory_max_size)
         logger.info("MemoryBank created: %s", memory_bank)
