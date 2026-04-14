@@ -274,9 +274,17 @@ def _load_ft_model_and_prepare_ckpt(args) -> str:
 # ---------------------------------------------------------------------------
 
 def _load_all_weights_from_hf_checkpoint(model_dir: str) -> dict:
-    """从 HuggingFace 格式 checkpoint 中加载所有权重（safetensors 优先，回退 .bin）。"""
+    """从 checkpoint 目录中加载所有权重。
+
+    按优先级依次尝试：
+      1. *.safetensors（新版 HF 格式）
+      2. diffusion_pytorch_model*.bin（ZeRO-3 save_16bit_model 输出，训练脚本默认格式）
+      3. pytorch_model*.bin（旧版 HF 格式）
+    """
     import glob
     state = {}
+
+    # 1. safetensors
     sf_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
     if sf_files:
         try:
@@ -284,11 +292,21 @@ def _load_all_weights_from_hf_checkpoint(model_dir: str) -> dict:
             for f in sf_files:
                 state.update(load_file(f, device="cpu"))
         except ImportError:
-            logger.warning("safetensors not available, trying torch.load for %s", model_dir)
+            logger.warning("safetensors not available, skipping .safetensors for %s", model_dir)
+            sf_files = []
+
+    # 2. diffusion_pytorch_model*.bin（ZeRO-3 / save_16bit_model 格式）
+    if not state:
+        bin_files = sorted(glob.glob(os.path.join(model_dir, "diffusion_pytorch_model*.bin")))
+        for f in bin_files:
+            state.update(torch.load(f, map_location="cpu", weights_only=True))
+
+    # 3. pytorch_model*.bin（旧版 HF 格式）
     if not state:
         bin_files = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin")))
         for f in bin_files:
             state.update(torch.load(f, map_location="cpu", weights_only=True))
+
     logger.info(
         "_load_all_weights_from_hf_checkpoint: loaded %d keys from %s",
         len(state), model_dir,
