@@ -148,11 +148,13 @@ fi
 if [ "${USE_MEMORY}" = "true" ] && [ "${NUM_GPUS}" -gt 1 ]; then
     CMD+=(--ulysses_size "${NUM_GPUS}")
     CMD+=(--t5_fsdp)          # 多卡时对 T5 做 FSDP 分片，避免每卡复制全量 T5（~22 GiB）
+    # 动态选取空闲端口，避免 EADDRINUSE
+    MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
     # 替换脚本中第一个元素 python → torchrun
     LAUNCH=(
         torchrun
         --nproc_per_node "${NUM_GPUS}"
-        --master_port 29500
+        --master_port "${MASTER_PORT}"
     )
     # CMD 第一个元素是 "python"，第二个是脚本路径
     # 重新构造：去掉 python，用 torchrun + 脚本路径
