@@ -11,7 +11,7 @@ PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR=""
+FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_single/epoch_2"
                          # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
 FT_HIGH_MODEL_DIR=""
                          # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
@@ -33,7 +33,7 @@ GUIDE_SCALE=5.0
 SIZE="480*832"
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="2"
+CUDA_VISIBLE_DEVICES="0"
 
 
 # ============================================================
