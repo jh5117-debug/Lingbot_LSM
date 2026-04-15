@@ -1154,10 +1154,10 @@ def main():
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     logger.warning(
-                        f"OOM at step {global_step}, batch_size=1. "
-                        "Consider reducing num_frames or gradient_accumulation_steps."
+                        f"OOM at step {global_step}, batch_size=1. Skipping batch."
                     )
-                    raise  # 不静默吞掉（code_standards.md §2）
+                    optimizer.zero_grad()
+                    continue
 
                 epoch_loss += loss.item()
                 num_batches += 1

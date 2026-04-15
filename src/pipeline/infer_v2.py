@@ -1012,6 +1012,43 @@ def main():
                     _nfp_captured_hs['hs'] = hs.detach().cpu()
                 _nfp_hook_handle = _model_lnm.blocks[-1].register_forward_hook(_nfp_capture_hook)
 
+            # MODIFIED: multi-clip action offset bugfix — 为每个 clip 按 clip_idx 切片
+            # action/poses/intrinsics 写入临时目录，避免 generate() 总从 [0:frame_num] 读取
+            _clip_action_start = clip_idx * args.frame_num
+            _clip_action_end = _clip_action_start + args.frame_num
+            _tmp_dir = None
+            if _poses_np is not None and args.action_path:
+                import tempfile as _tempfile_clip
+                _tmp_dir = _tempfile_clip.mkdtemp(
+                    prefix=f"lingbot_infer_clip{clip_idx}_r{rank}_"
+                )
+                # 按 clip_idx 切片，越界时 fallback 到最后 frame_num 帧
+                if _clip_action_end <= len(_poses_np):
+                    _tmp_poses = _poses_np[_clip_action_start:_clip_action_end]
+                    _tmp_actions = _actions_np[_clip_action_start:_clip_action_end]
+                    _tmp_intrinsics = _intrinsics_np[_clip_action_start:_clip_action_end]
+                else:
+                    _tmp_poses = _poses_np[-args.frame_num:]
+                    _tmp_actions = _actions_np[-args.frame_num:]
+                    _tmp_intrinsics = _intrinsics_np[-args.frame_num:]
+                import numpy as _np_clip_tmp
+                _np_clip_tmp.save(
+                    os.path.join(_tmp_dir, "poses.npy"), _tmp_poses
+                )
+                _np_clip_tmp.save(
+                    os.path.join(_tmp_dir, "action.npy"), _tmp_actions
+                )
+                _np_clip_tmp.save(
+                    os.path.join(_tmp_dir, "intrinsics.npy"), _tmp_intrinsics
+                )
+                _action_path_for_clip = _tmp_dir
+                logger.info(
+                    "Clip %d: wrote per-clip action slice [%d:%d] to tmpdir %s (rank %d)",
+                    clip_idx + 1, _clip_action_start, _clip_action_end, _tmp_dir, rank,
+                )
+            else:
+                _action_path_for_clip = args.action_path
+
             # 注入 memory_states / memory_value_states 并生成
             # MODIFIED: F-03/F5 fix — 同时传入 visual_emb 作为 V
             _patch_pipeline_memory(wan_i2v, memory_states, memory_value_states_clip)
@@ -1019,7 +1056,7 @@ def main():
                 video = wan_i2v.generate(
                     args.prompt,
                     current_img,
-                    action_path=args.action_path,
+                    action_path=_action_path_for_clip,
                     max_area=max_area,
                     frame_num=args.frame_num,
                     shift=args.sample_shift,
@@ -1035,6 +1072,11 @@ def main():
                 if _nfp_hook_handle is not None:
                     _nfp_hook_handle.remove()
                     _nfp_hook_handle = None
+                # 清理临时 action 目录
+                if _tmp_dir is not None:
+                    import shutil as _shutil_clip
+                    _shutil_clip.rmtree(_tmp_dir, ignore_errors=True)
+                    _tmp_dir = None
             _last_hs_for_nfp = _nfp_captured_hs.pop('hs', None)
 
             if rank == 0 and video is not None:

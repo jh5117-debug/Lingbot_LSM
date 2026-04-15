@@ -11,19 +11,19 @@ PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_single/epoch_2"
+FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/low_noise_model/epoch_2"
                          # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
-FT_HIGH_MODEL_DIR=""
+FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/high_noise_model/epoch_2"
                          # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
                          # FT_HIGH_MODEL_DIR 有值时视为 dual 模式，此时 FT_MODEL_DIR 也必须填写
 
 # Memory Bank（训练出的模型设为 true，baseline 保持 false）
-USE_MEMORY=false
+USE_MEMORY=true
 MEMORY_MAX_SIZE=50
 
 # 推理参数
 FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
-NUM_CLIPS=1              # 当前固定 1 个 clip
+NUM_CLIPS=2              # 当前固定 1 个 clip
                          # TODO 多 clip 推理：将 NUM_CLIPS 改为目标数量（如 5），
                          # 并确保 ACTION_PATH 目录内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS，
                          # 同时将 USE_MEMORY=true 以利用 Memory Bank 跨 clip 传递上下文。
@@ -33,7 +33,7 @@ GUIDE_SCALE=5.0
 SIZE="480*832"
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0"
+CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 
 # ============================================================
