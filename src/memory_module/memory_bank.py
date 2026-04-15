@@ -1,10 +1,30 @@
 """
-memory_bank.py — Surprise-Driven Memory Bank
+memory_bank.py — Memory Bank 模块
 
-存储 VAE latent 帧 + camera pose embedding，按 Surprise score 筛选，
-用 cosine similarity 检索最相关的历史帧供 MemoryCrossAttention 使用。
+当前实现（v2，已完成）：单层 MemoryBank
+  - MemoryFrame dataclass：单帧记忆条目，含 pose_emb / visual_emb / latent / surprise_score / timestep / chunk_id / age / （待新增：semantic_key）
+  - MemoryBank：固定容量 K，surprise-driven 写入（evict 最低 surprise 帧）
+  - retrieve()：query_pose_emb 与存储帧做 cosine similarity，返回 (pose_embs [k,5120], visual_embs [k,5120])
+
+下一步实现（待实现，参见 state/design_gap.md）：三层 ThreeTierMemoryBank
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  ShortTermBank   │ FIFO，容量 2，强制存最近帧，保证 chunk 连续性          │
+  │  MediumTermBank  │ 容量 8，高 surprise 帧，age decay eviction           │
+  │  LongTermBank    │ 容量 8-16，stable（低 surprise）且 novel（语义新颖）帧 │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  新增：semantic_key = cross_attn.norm_k(cross_attn.k(pose_emb)).detach()
+        LongTermBank novelty check：max cosine_sim(semantic_key, existing_keys) < NOVELTY_THRESHOLD
+        LongTermBank eviction：移除语义最冗余帧（max sim 最大者）
+
+  混合检索预算（Hybrid Retrieval Budget）：Short 2 + Medium top-3 + Long top-2 = 7 帧
+  retrieve() 返回：(key_states [7,5120], value_states [7,5120])
 
 依赖：PyTorch（无 lingbot-world 依赖，独立可测试）
+设计参考：
+  - WorldMem：Memory Bank 结构 + FOV pose 检索
+  - Cambrian-S：NFPHead Surprise 机制（见 nfp_head.py）
+  - HyDRA（Out of Sight but Not Out of Mind）：semantic_key 借鉴 K 投影特征提取器思路
 """
 
 import logging
