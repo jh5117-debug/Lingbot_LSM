@@ -11,14 +11,14 @@ PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/low_noise_model/epoch_1"
+FT_MODEL_DIR=""
                          # 全参微调 / dual-low  目录（如 .../train_v2_stage1_dual/low_noise_model/epoch_2）
-FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v2_stage1_dual/high_noise_model/epoch_1"
+FT_HIGH_MODEL_DIR=""
                          # dual-high 目录（如 .../train_v2_stage1_dual/high_noise_model/epoch_2）
                          # FT_HIGH_MODEL_DIR 有值时视为 dual 模式，此时 FT_MODEL_DIR 也必须填写
 
 # Memory Bank（训练出的模型设为 true，baseline 保持 false）
-USE_MEMORY=true
+USE_MEMORY=false
 MEMORY_MAX_SIZE=50
 
 # 推理参数
