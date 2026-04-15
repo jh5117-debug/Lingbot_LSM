@@ -5,8 +5,8 @@ set -euo pipefail
 # 用户配置区 — 修改以下变量后运行 bash run_infer_v2.sh
 # ============================================================
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005"
+IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0008_inst_000_clip0015/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0008_inst_000_clip0015"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
@@ -33,7 +33,7 @@ GUIDE_SCALE=5.0
 SIZE="480*832"
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0"
+CUDA_VISIBLE_DEVICES="2"
 
 
 # ============================================================
