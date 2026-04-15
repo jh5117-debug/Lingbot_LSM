@@ -868,6 +868,19 @@ def main():
                 wan_i2v.high_noise_model = _configure_memory_model_for_dist(
                     wan_i2v.high_noise_model, use_sp=True, device=device)
 
+        # T5-FSDP + SP 模式：SP init 会把 DiT 搬到 GPU，但 generate() 第一步就做 T5 FSDP
+        # 文本编码，此时 DiT 和 T5 同时在 GPU 会 OOM（CUBLAS_STATUS_ALLOC_FAILED）。
+        # 将 DiT 提前卸载到 CPU；generate(offload_model=True) 会在每个时间步按需搬回 GPU。
+        if args.t5_fsdp and _use_sp:
+            logger.info(
+                "T5-FSDP+SP mode: offloading DiT to CPU before text encoding to avoid OOM"
+            )
+            for _attr in ('low_noise_model', 'high_noise_model'):
+                _m = getattr(wan_i2v, _attr, None)
+                if _m is not None and next(_m.parameters()).device.type == 'cuda':
+                    _m.to('cpu')
+            torch.cuda.empty_cache()
+
         memory_bank = MemoryBank(max_size=args.memory_max_size)
         logger.info("MemoryBank created: %s", memory_bank)
 
