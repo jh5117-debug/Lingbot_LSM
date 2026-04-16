@@ -939,7 +939,7 @@ def multi_clip_training_step(
 
             # 3. 用 get_projected_frame_embs 计算 frame_embs: [lat_f, 5120]
             c2ws_emb_raw = dit_cond_dict["c2ws_plucker_emb"][0]  # [1, C, lat_f, lat_h, lat_w]
-            frame_embs = model.get_projected_frame_embs(c2ws_emb_raw)  # [lat_f, 5120]
+            frame_embs = model.get_projected_frame_embs(c2ws_emb_raw).detach()  # [lat_f, 5120]，显式 detach 确保不携带梯度（已在 no_grad 内，此为双重保障）
 
             # 4. bank 非空时先 retrieve，用于 context forward（若 bank 为空则用 dummy）
             query_emb_ctx = frame_embs[0]  # 第一帧 pose emb
@@ -1078,6 +1078,8 @@ def multi_clip_training_step(
 
     with torch.no_grad():
         context = trainer.encode_text(prompt)
+        # M-3 fix: encode_text 可能返回 float32，model forward 期望 bfloat16
+        context = [c.to(torch.bfloat16) if hasattr(c, 'dtype') and c.dtype != torch.bfloat16 else c for c in context]
         y = trainer.prepare_y(video, video_latent)
 
     dit_cond_dict = trainer.prepare_control_signal(

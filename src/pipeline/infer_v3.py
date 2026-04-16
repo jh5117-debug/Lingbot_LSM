@@ -27,7 +27,12 @@ import os
 import sys
 from os.path import abspath, dirname, join
 
+import numpy as np
+import shutil
+import tempfile
+
 import torch
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # sys.path 设置
@@ -864,6 +869,14 @@ def main():
                 _m.to('cpu')
         torch.cuda.empty_cache()
 
+    # M-2 fix: 多卡时必须启用 Ulysses，否则各 rank 生成结果不一致
+    if world_size > 1 and args.ulysses_size != world_size:
+        raise ValueError(
+            f"world_size={world_size} but ulysses_size={args.ulysses_size}. "
+            "When running multi-GPU inference, ulysses_size must equal world_size. "
+            "Use --ulysses_size to set it, or run single-GPU."
+        )
+
     # 创建 ThreeTierMemoryBank（使用 CLI 参数，全量超参数暴露）
     bank = ThreeTierMemoryBank(
         short_cap=args.short_cap,
@@ -968,6 +981,7 @@ def main():
         else:
             # 检索 memory（首 clip 时 bank 为空，memory_states=None）
             memory_states = None
+            memory_value_states_clip = None
             if bank.size() > 0:
                 # HIGH-1 修复：用 get_projected_frame_embs 计算真实 pose query
                 model_lnm = wan_i2v.low_noise_model
@@ -997,10 +1011,23 @@ def main():
                 )
                 if retrieved is not None:
                     key_states, value_states = retrieved   # 各 [k, 5120]，k ≤ 7
+                    assert key_states.shape[0] <= 7, (
+                        f"Clip {clip_idx+1}: retrieve() returned {key_states.shape[0]} frames, max budget is 7"
+                    )
                     memory_states = key_states.unsqueeze(0)               # [1, K, dim]
                     memory_value_states_clip = value_states.unsqueeze(0)  # [1, K, dim]
                     logger.info("Clip %d: retrieved %d memory frames.", clip_idx + 1, key_states.shape[0])
+            # C-1 fix: 多卡场景下广播 rank=0 检索结果给所有 rank
+            # 这处理 M-4 广播为 None（模型非 WanModelWithMemory 或无 pose 数据）时的退化路径
+            if world_size > 1 and dist.is_initialized():
+                _c1_payload = [(memory_states, memory_value_states_clip) if memory_states is not None else None]
+                dist.broadcast_object_list(_c1_payload, src=0)
+                if _c1_payload[0] is not None:
+                    _c1_ms, _c1_mv = _c1_payload[0]
+                    memory_states = _c1_ms.to(device)
+                    memory_value_states_clip = _c1_mv.to(device)
                 else:
+                    memory_states = None
                     memory_value_states_clip = None
 
         # M-1 修复：注册 forward hook 捕获 model.blocks[-1] hidden_states（供 NFPHead 使用）
@@ -1018,8 +1045,7 @@ def main():
         _clip_action_end = _clip_action_start + args.frame_num
         _tmp_dir = None
         if _poses_np is not None and args.action_path:
-            import tempfile as _tempfile_clip
-            _tmp_dir = _tempfile_clip.mkdtemp(
+            _tmp_dir = tempfile.mkdtemp(
                 prefix=f"lingbot_infer_clip{clip_idx}_r{rank}_"
             )
             if _clip_action_end <= len(_poses_np):
@@ -1030,14 +1056,13 @@ def main():
                 _tmp_poses = _poses_np[-args.frame_num:]
                 _tmp_actions = _actions_np[-args.frame_num:]
                 _tmp_intrinsics = _intrinsics_np[-args.frame_num:]
-            import numpy as _np_clip_tmp
-            _np_clip_tmp.save(
+            np.save(
                 os.path.join(_tmp_dir, "poses.npy"), _tmp_poses
             )
-            _np_clip_tmp.save(
+            np.save(
                 os.path.join(_tmp_dir, "action.npy"), _tmp_actions
             )
-            _np_clip_tmp.save(
+            np.save(
                 os.path.join(_tmp_dir, "intrinsics.npy"), _tmp_intrinsics
             )
             _action_path_for_clip = _tmp_dir
@@ -1072,15 +1097,13 @@ def main():
                 _nfp_hook_handle = None
             # 清理临时 action 目录
             if _tmp_dir is not None:
-                import shutil as _shutil_clip
-                _shutil_clip.rmtree(_tmp_dir, ignore_errors=True)
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
                 _tmp_dir = None
         _last_hs_for_nfp = _nfp_captured_hs.pop('hs', None)
 
         if rank == 0 and video is not None:
             # HIGH-3 修复：确保存入 all_videos 的是 torch.Tensor
-            import numpy as _np_h3
-            _video_tensor = torch.from_numpy(video.copy()) if isinstance(video, _np_h3.ndarray) else video
+            _video_tensor = torch.from_numpy(video.copy()) if isinstance(video, np.ndarray) else video
             all_videos.append(_video_tensor)
             # 更新 ThreeTierMemoryBank（v3 新增 semantic_key 计算）
             _update_memory_bank_v3(
@@ -1094,15 +1117,13 @@ def main():
                 chunk_id=clip_idx,
             )
             # 使用最后一帧作为下一 clip 的初始帧
-            from PIL import Image as PILImage
-            import numpy as _np_frame
             last_frame_chw = video[:, -1]  # [C=3, H, W]
             if hasattr(last_frame_chw, 'cpu'):
                 last_frame_chw = last_frame_chw.cpu().float().numpy()
             # CHW → HWC，[-1,1] → [0,255]
             last_frame_hwc = last_frame_chw.transpose(1, 2, 0)
-            last_frame_np = (last_frame_hwc * 127.5 + 127.5).clip(0, 255).astype(_np_frame.uint8)
-            current_img = PILImage.fromarray(last_frame_np)
+            last_frame_np = (last_frame_hwc * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
+            current_img = Image.fromarray(last_frame_np)
             logger.info("Clip %d: bank updated. Total size=%d", clip_idx + 1, bank.size())
             logger.info("Clip %d: bank stats: %s", clip_idx + 1, bank.get_stats())
 
