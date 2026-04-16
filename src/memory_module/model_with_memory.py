@@ -261,6 +261,26 @@ class WanModelWithMemory(WanModel):
         # 线性投影：[z_dim=16] → [dim=5120]
         return self.latent_proj(feat)  # [dim=5120]
 
+    @torch.no_grad()
+    def get_semantic_key(self, pose_emb: Tensor) -> Tensor:
+        """计算 pose_emb 在 K 投影空间的语义键（用于 LongTermBank 语义相似度）。
+
+        使用所有 memory 层的 K 投影平均，不同层捕捉不同抽象层次的场景特征，
+        平均后对 novelty check 和检索更鲁棒（借鉴 HyDRA 思路，本工作独立设计）。
+
+        Args:
+            pose_emb: [dim=5120]，单帧的 camera pose embedding（来自 get_projected_frame_embs 的某一帧）
+
+        Returns:
+            semantic_key: [dim=5120]，所有 memory 层 K 投影的平均，已 detach
+        """
+        keys = []
+        for idx in self._memory_layers:
+            ca = self.blocks[idx].memory_cross_attn
+            # ca.k: Linear(dim → dim)，ca.norm_k: RMSNorm
+            keys.append(ca.norm_k(ca.k(pose_emb)))
+        return torch.stack(keys).mean(dim=0).detach()  # [dim=5120]
+
     # ------------------------------------------------------------------
     # 推理辅助：提取 per-frame pose embedding（用于 MemoryBank 存储与检索）
     # ------------------------------------------------------------------

@@ -827,6 +827,17 @@ def main():
         _wan_use_sp   = _use_sp
         _wan_dit_fsdp = _use_fsdp
 
+    # Ulysses SP 要求 num_heads 能被 ulysses_size 整除
+    if args.ulysses_size > 1:
+        _num_heads = cfg.num_heads
+        if _num_heads % args.ulysses_size != 0:
+            _valid = sorted(i for i in range(1, _num_heads + 1) if _num_heads % i == 0)
+            raise ValueError(
+                f"Ulysses SP requires num_heads ({_num_heads}) % ulysses_size "
+                f"({args.ulysses_size}) == 0. "
+                f"Valid GPU counts: {_valid}"
+            )
+
     wan_i2v = WanI2V(
         config=cfg,
         checkpoint_dir=args.ckpt_dir,

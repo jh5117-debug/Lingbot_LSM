@@ -5,8 +5,8 @@ set -euo pipefail
 # 用户配置区 — 修改以下变量后运行 bash run_infer_v2.sh
 # ============================================================
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010"
+IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_2_player_0001_inst_000_clip0005/"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
@@ -23,7 +23,7 @@ MEMORY_MAX_SIZE=50
 
 # 推理参数
 FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
-NUM_CLIPS=2              # 当前固定 1 个 clip
+NUM_CLIPS=5              # 当前固定 1 个 clip
                          # TODO 多 clip 推理：将 NUM_CLIPS 改为目标数量（如 5），
                          # 并确保 ACTION_PATH 目录内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS，
                          # 同时将 USE_MEMORY=true 以利用 Memory Bank 跨 clip 传递上下文。
@@ -44,6 +44,15 @@ export CUDA_VISIBLE_DEVICES
 
 # ---------- GPU 计数 ----------
 NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
+
+# Wan14B 固定 40 个 attention heads；Ulysses SP 要求 num_heads % GPU数 == 0
+if [ "${NUM_GPUS}" -gt 1 ] && [ "${USE_MEMORY}" = "true" ]; then
+    if [ $((40 % NUM_GPUS)) -ne 0 ]; then
+        echo "[ERROR] Ulysses SP：${NUM_GPUS} 个 GPU 不能整除 Wan14B 的 40 个 attention heads（余数 $((40 % NUM_GPUS))）。" >&2
+        echo "[ERROR] 请将 CUDA_VISIBLE_DEVICES 的 GPU 数量改为 40 的因数，推荐：1 / 2 / 4 / 5 / 8 / 10" >&2
+        exit 1
+    fi
+fi
 
 # ---------- 路径检查 ----------
 _err=0

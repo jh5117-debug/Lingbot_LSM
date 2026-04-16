@@ -4,15 +4,26 @@ set -euo pipefail
 # ============================================================
 # 用户配置区 — 修改以下变量后运行 bash run_train_v3_dual.sh
 # ============================================================
-# 实验配置 ⑥：v3 数据（8ch action）+ Stage1 + 双模型
-# 状态：PENDING — 等待 train_v3_stage1_dual.py 和 v3 数据（8ch action）就绪
+# 实验配置 ⑥：v3 数据（8ch 视频，前4维 WASD action）+ Stage1 + 双模型
+# 方法：Method B 多 clip 顺序训练，ThreeTierMemoryBank
+#
+# 训练流程：sequential（先 low_noise_model，完成后自动运行 high_noise_model）
+# 输出目录：OUTPUT_DIR/low_noise_model/ 和 OUTPUT_DIR/high_noise_model/
+#
+# 与 run_train_v2_dual.sh 的差异：
+#   - 调用 train_v3_stage1_dual.py（支持多 clip 顺序训练）
+#   - 新增 --num_context_clips（context clip 数量，默认 1）
+#   - 新增全量 ThreeTierMemoryBank 超参数（10 个）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
-DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3_8ch"   # 8ch action 数据集
+DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3_8ch"   # v3 数据集目录
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v3_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
+
+LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调
+LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 NUM_EPOCHS=5
 LEARNING_RATE=1e-4
@@ -26,7 +37,21 @@ NUM_FRAMES=81
 HEIGHT=480
 WIDTH=832
 NFP_LOSS_WEIGHT=0.1
-ACTION_DIM=8                      # v3 新增：8ch action（v2 为 4）
+
+# ---- v3 新增：多 clip 顺序训练 ----
+NUM_CONTEXT_CLIPS=1        # context clip 数量（N-1）；总 clip 数 = NUM_CONTEXT_CLIPS + 1
+
+# ---- ThreeTierMemoryBank 超参数（保持 v3 默认值）----
+SHORT_CAP=2                # ShortTermBank 容量（FIFO，保证 chunk 间衔接）
+MEDIUM_CAP=8               # MediumTermBank 容量（高 surprise 帧 + age decay 淘汰）
+LONG_CAP=16                # LongTermBank 容量（stable AND novel 帧，支持场景重访）
+SURPRISE_THRESHOLD=0.4     # Medium 写入下限（surprise >= threshold 才写入）
+STABILITY_THRESHOLD=0.2    # Long stable 写入上限（surprise < threshold 视为 stable）
+NOVELTY_THRESHOLD=0.7      # Long novelty 写入上限（max cosine_sim < threshold 视为 novel）
+HALF_LIFE=10.0             # Medium age decay 半衰期（单位 chunk）
+HYBRID_MEDIUM_K=3          # 混合检索预算中 Medium 层 top-K
+HYBRID_LONG_K=2            # 混合检索预算中 Long 层 top-K
+DUP_THRESHOLD=0.95         # cross-tier dedup 阈值（pose_emb cosine_sim > 阈值则去重）
 
 CUDA_VISIBLE_DEVICES="0,1,2,3"
 
@@ -38,6 +63,7 @@ export CUDA_VISIBLE_DEVICES
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l | xargs)
 
+# ---------- 路径检查 ----------
 _err=0
 if [ -z "${CKPT_DIR}" ]; then
     echo "[ERROR] CKPT_DIR 未设置" >&2; _err=1
@@ -61,6 +87,7 @@ LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 
 mkdir -p "${OUTPUT_DIR}"
 
+# ---------- 公共参数数组（两个模型共用）----------
 COMMON_ARGS=(
     --config_file "${ACCEL_CONFIG}"
     --num_processes "${NUM_GPUS}"
@@ -82,15 +109,34 @@ TRAIN_ARGS=(
     --height                      "${HEIGHT}"
     --width                       "${WIDTH}"
     --nfp_loss_weight             "${NFP_LOSS_WEIGHT}"
-    --action_dim                  "${ACTION_DIM}"
     --gradient_checkpointing
+    --num_context_clips           "${NUM_CONTEXT_CLIPS}"
+    --short_cap                   "${SHORT_CAP}"
+    --medium_cap                  "${MEDIUM_CAP}"
+    --long_cap                    "${LONG_CAP}"
+    --surprise_threshold          "${SURPRISE_THRESHOLD}"
+    --stability_threshold         "${STABILITY_THRESHOLD}"
+    --novelty_threshold           "${NOVELTY_THRESHOLD}"
+    --half_life                   "${HALF_LIFE}"
+    --hybrid_medium_k             "${HYBRID_MEDIUM_K}"
+    --hybrid_long_k               "${HYBRID_LONG_K}"
+    --dup_threshold               "${DUP_THRESHOLD}"
 )
+
+if [ "${LORA_RANK}" -gt 0 ]; then
+    TRAIN_ARGS+=(--lora_rank "${LORA_RANK}")
+    if [ -n "${LORA_TARGET_MODULES}" ]; then
+        TRAIN_ARGS+=(--lora_target_modules "${LORA_TARGET_MODULES}")
+    fi
+fi
 
 TRAIN_SCRIPT="${PROJECT_ROOT}/src/pipeline/train_v3_stage1_dual.py"
 
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 双模型训练 v3 启动"
-echo "  实验配置 ⑥：v3（8ch action）+ Stage1 + 双模型"
+echo "  实验配置 ⑥：v3（Method B 多 clip 顺序训练，ThreeTierMemoryBank）"
+echo "  NUM_CONTEXT_CLIPS  : ${NUM_CONTEXT_CLIPS}"
+echo "  ThreeTierMemoryBank: short=${SHORT_CAP} medium=${MEDIUM_CAP} long=${LONG_CAP}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NUM_GPUS           : ${NUM_GPUS}"
 echo "  OUTPUT_DIR         : ${OUTPUT_DIR}"
@@ -114,7 +160,11 @@ fi
 echo "执行命令（low）："
 echo "${CMD_LOW[*]}"
 echo ""
-"${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"
+"${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"; _LOW_EXIT="${PIPESTATUS[0]}"
+if [ "${_LOW_EXIT}" -ne 0 ]; then
+    echo "[ERROR] low_noise_model 训练失败，退出码 ${_LOW_EXIT}" >&2
+    exit "${_LOW_EXIT}"
+fi
 echo ""
 echo "===== low_noise_model 训练完成 ====="
 
@@ -135,7 +185,7 @@ fi
 echo "执行命令（high）："
 echo "${CMD_HIGH[*]}"
 echo ""
-"${CMD_HIGH[@]}" 2>&1 | tee -a "${LOG_FILE}"
+"${CMD_HIGH[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
 
 echo ""
 echo "===== 双模型训练完成 ====="

@@ -35,7 +35,10 @@ _PIPELINE_DIR = os.path.join(_ROOT, 'pipeline')
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
-from memory_module.memory_bank import MemoryBank, MemoryFrame
+from memory_module.memory_bank import (
+    MemoryBank, MemoryFrame,
+    ShortTermBank, MediumTermBank, LongTermBank, ThreeTierMemoryBank,
+)
 from memory_module.nfp_head import NFPHead
 
 HAS_CUDA = torch.cuda.is_available()
@@ -686,6 +689,362 @@ def test_model_with_memory_imports_and_constants():
 
 
 # ---------------------------------------------------------------------------
+# ThreeTierMemoryBank 测试（CPU + GPU）
+# ---------------------------------------------------------------------------
+
+def test_short_term_bank_fifo():
+    """验证 ShortTermBank FIFO 行为和 tier 标记。"""
+    try:
+        bank = ShortTermBank(cap=2)
+        dim = 64
+
+        frames = [
+            MemoryFrame(
+                pose_emb=torch.randn(dim),
+                latent=torch.randn(16, 4, 4),
+                surprise_score=0.5,
+                timestep=i,
+                visual_emb=torch.randn(dim),
+            )
+            for i in range(3)
+        ]
+
+        bank.update(frames[0])
+        assert bank.size() == 1, f"expected 1, got {bank.size()}"
+
+        bank.update(frames[1])
+        assert bank.size() == 2, f"expected 2, got {bank.size()}"
+
+        # 第3帧插入 → FIFO：最旧帧被弹出，size 仍为 2
+        bank.update(frames[2])
+        assert bank.size() == 2, f"expected 2 after FIFO eviction, got {bank.size()}"
+
+        # retrieve_all() 检查：最旧帧（t=0）应已被弹出，剩下 t=1 和 t=2
+        all_frames = bank.retrieve_all()
+        assert len(all_frames) == 2, f"expected 2 frames, got {len(all_frames)}"
+        assert all_frames[0].timestep == 1, \
+            f"expected timestep=1 (oldest remaining), got {all_frames[0].timestep}"
+        assert all_frames[1].timestep == 2, \
+            f"expected timestep=2, got {all_frames[1].timestep}"
+
+        # 每帧的 tier 字段应等于 "short"
+        for f in all_frames:
+            assert f.tier == "short", f"expected tier='short', got tier='{f.tier}'"
+
+        logger.info("[PASS] test_short_term_bank_fifo")
+    except Exception as e:
+        logger.error(f"[FAIL] test_short_term_bank_fifo: {e}")
+        raise
+
+
+def test_medium_term_bank_surprise_eviction():
+    """验证 MediumTermBank 写入阈值 + effective_score eviction。"""
+    try:
+        bank = MediumTermBank(cap=2, surprise_threshold=0.4, half_life=10.0)
+        dim = 64
+
+        # surprise=0.3 < 0.4 → rejected
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.3,
+            timestep=-1,
+            visual_emb=torch.randn(dim),
+        ))
+        assert bank.size() == 0, f"surprise=0.3 should be rejected, size={bank.size()}"
+
+        # surprise=0.5 → stored
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.5,
+            timestep=0,
+            visual_emb=torch.randn(dim),
+        ))
+        assert bank.size() == 1, f"expected size=1, got {bank.size()}"
+
+        # surprise=0.6 → stored，已满（cap=2）
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.6,
+            timestep=1,
+            visual_emb=torch.randn(dim),
+        ))
+        assert bank.size() == 2, f"expected size=2, got {bank.size()}"
+
+        # increment_age() 20 次
+        # effective_score(t=0) = 0.5 * (0.5 ** (20/10)) = 0.5 * 0.25 = 0.125
+        # effective_score(t=1) = 0.6 * 0.25 = 0.15
+        for _ in range(20):
+            bank.increment_age()
+
+        # 插入 surprise=0.8 → 替换 effective_score 最低的帧（t=0，score=0.125）
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.8,
+            timestep=2,
+            visual_emb=torch.randn(dim),
+        ))
+        assert bank.size() == 2, f"expected size=2 after eviction, got {bank.size()}"
+
+        # t=0 应已被替换
+        remaining_timesteps = [f.timestep for f in bank.frames]
+        assert 0 not in remaining_timesteps, \
+            f"timestep=0 should have been evicted, remaining: {remaining_timesteps}"
+
+        logger.info("[PASS] test_medium_term_bank_surprise_eviction")
+    except Exception as e:
+        logger.error(f"[FAIL] test_medium_term_bank_surprise_eviction: {e}")
+        raise
+
+
+def test_long_term_bank_novelty_check():
+    """验证 LongTermBank stable AND novel 写入条件。"""
+    try:
+        bank = LongTermBank(cap=4, stability_threshold=0.5, novelty_threshold=0.7)
+        dim = 64
+
+        # 构造正交向量对
+        v_a = torch.randn(dim)
+        v_a /= v_a.norm()
+        v_b = torch.randn(dim)
+        v_b = v_b - (v_b @ v_a) * v_a
+        v_b /= v_b.norm()
+        assert abs(float(v_a @ v_b)) < 0.01, "v_a and v_b should be orthogonal"
+
+        # surprise=0.9 > 0.5（不满足 stable）→ rejected
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.9,
+            timestep=-1,
+            visual_emb=torch.randn(dim),
+            semantic_key=torch.randn(dim),
+        ))
+        assert bank.size() == 0, f"high-surprise frame should be rejected, size={bank.size()}"
+
+        # surprise=0.1, semantic_key=v_a → stored
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.1,
+            timestep=0,
+            visual_emb=torch.randn(dim),
+            semantic_key=v_a.clone(),
+        ))
+        assert bank.size() == 1, f"expected size=1, got {bank.size()}"
+
+        # surprise=0.1, semantic_key=v_a（完全相同，cosine_sim=1.0 > 0.7）→ rejected（not novel）
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.1,
+            timestep=1,
+            visual_emb=torch.randn(dim),
+            semantic_key=v_a.clone(),
+        ))
+        assert bank.size() == 1, \
+            f"duplicate semantic_key should be rejected (not novel), size={bank.size()}"
+
+        # surprise=0.1, semantic_key=v_b（与 v_a 正交，cosine_sim≈0）→ stored
+        bank.update(MemoryFrame(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.1,
+            timestep=2,
+            visual_emb=torch.randn(dim),
+            semantic_key=v_b.clone(),
+        ))
+        assert bank.size() == 2, f"expected size=2 after novel frame, got {bank.size()}"
+
+        # 验证 t=0 和 t=2 在 bank 中，t=1 不在
+        stored_timesteps = {f.timestep for f in bank.frames}
+        assert 0 in stored_timesteps, "t=0 should be in bank"
+        assert 2 in stored_timesteps, "t=2 should be in bank"
+        assert 1 not in stored_timesteps, "t=1 should NOT be in bank (rejected for novelty)"
+
+        logger.info("[PASS] test_long_term_bank_novelty_check")
+    except Exception as e:
+        logger.error(f"[FAIL] test_long_term_bank_novelty_check: {e}")
+        raise
+
+
+def test_three_tier_retrieve_budget():
+    """验证 ThreeTierMemoryBank.retrieve() 的混合预算（max 7帧）和返回格式。"""
+    try:
+        bank = ThreeTierMemoryBank(
+            short_cap=2,
+            medium_cap=4,
+            long_cap=4,
+            surprise_threshold=0.4,
+            stability_threshold=0.3,
+            novelty_threshold=0.9,
+            dup_threshold=0.95,
+        )
+        dim = 64
+
+        # 构造正交向量对供 Long bank
+        v_a = torch.randn(dim)
+        v_a /= v_a.norm()
+        v_b = torch.randn(dim)
+        v_b = v_b - (v_b @ v_a) * v_a
+        v_b /= v_b.norm()
+
+        # t=0: surprise=0.05 < 0.3 → Long（stable+novel）；< 0.4 → not Medium；→ Short
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.05,
+            timestep=0,
+            visual_emb=torch.randn(dim),
+            semantic_key=v_a.clone(),
+        )
+
+        # t=1: surprise=0.05，semantic_key 与 t=0 正交 → Long；→ Short（FIFO）
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.05,
+            timestep=1,
+            visual_emb=torch.randn(dim),
+            semantic_key=v_b.clone(),
+        )
+
+        # t=2: surprise=0.6 > 0.4 → Medium；>= 0.3 → not stable → not Long；→ Short（FIFO）
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.6,
+            timestep=2,
+            visual_emb=torch.randn(dim),
+            semantic_key=torch.randn(dim),
+        )
+
+        # t=3: surprise=0.6 → Medium；→ Short（FIFO，此时 Short 存 t=2, t=3）
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.6,
+            timestep=3,
+            visual_emb=torch.randn(dim),
+            semantic_key=torch.randn(dim),
+        )
+
+        # t=4: surprise=0.8 → Medium；→ Short（FIFO，Short 存 t=3, t=4）
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.8,
+            timestep=4,
+            visual_emb=torch.randn(dim),
+            semantic_key=torch.randn(dim),
+        )
+
+        query_emb = torch.randn(dim)
+        query_sk = torch.randn(dim)
+        query_sk /= query_sk.norm()
+
+        retrieved = bank.retrieve(query_emb, query_semantic_key=query_sk)
+
+        assert retrieved is not None, "retrieve() should not return None for non-empty bank"
+        assert isinstance(retrieved, tuple), \
+            f"retrieve() should return tuple, got {type(retrieved)}"
+        assert len(retrieved) == 2, \
+            f"retrieve() tuple should have length 2, got {len(retrieved)}"
+
+        key_states, value_states = retrieved
+
+        assert key_states.shape[0] >= 1, "should retrieve at least 1 frame"
+        assert key_states.shape[0] <= 7, \
+            f"should retrieve at most 7 frames (budget), got {key_states.shape[0]}"
+        assert key_states.shape[1] == dim, \
+            f"key dim should be {dim}, got {key_states.shape[1]}"
+        assert value_states.shape == key_states.shape, \
+            f"value_states shape {value_states.shape} != key_states shape {key_states.shape}"
+
+        logger.info("[PASS] test_three_tier_retrieve_budget")
+    except Exception as e:
+        logger.error(f"[FAIL] test_three_tier_retrieve_budget: {e}")
+        raise
+
+
+def test_three_tier_get_stats():
+    """验证 get_stats() 返回格式包含所有必要 key。"""
+    try:
+        bank = ThreeTierMemoryBank(
+            short_cap=2,
+            medium_cap=4,
+            long_cap=4,
+            surprise_threshold=0.4,
+            stability_threshold=0.3,
+            novelty_threshold=0.9,
+            dup_threshold=0.95,
+        )
+        dim = 64
+
+        # 插入1帧：surprise=0.1 < 0.3 → stable → Long；< 0.4 → not Medium；→ Short
+        v = torch.randn(dim)
+        v /= v.norm()
+        bank.update(
+            pose_emb=torch.randn(dim),
+            latent=torch.randn(16, 4, 4),
+            surprise_score=0.1,
+            timestep=0,
+            visual_emb=torch.randn(dim),
+            semantic_key=v,
+        )
+
+        stats = bank.get_stats()
+
+        assert isinstance(stats, dict), f"get_stats() should return dict, got {type(stats)}"
+        assert "memory/short_bank_size" in stats, \
+            "stats missing 'memory/short_bank_size'"
+        assert "memory/medium_bank_size" in stats, \
+            "stats missing 'memory/medium_bank_size'"
+        assert "memory/long_bank_size" in stats, \
+            "stats missing 'memory/long_bank_size'"
+        assert "memory/three_tier_total_size" in stats, \
+            "stats missing 'memory/three_tier_total_size'"
+
+        logger.info("[PASS] test_three_tier_get_stats")
+    except Exception as e:
+        logger.error(f"[FAIL] test_three_tier_get_stats: {e}")
+        raise
+
+
+def test_three_tier_get_semantic_key_shape():
+    """验证 WanModelWithMemory.get_semantic_key() 返回 [dim] 且 requires_grad=False。"""
+    if not HAS_CUDA:
+        logger.info("[SKIP] test_three_tier_get_semantic_key_shape (no CUDA)")
+        return
+
+    try:
+        from memory_module.model_with_memory import WanModelWithMemory
+
+        dim = 32
+        base = _make_tiny_wan_model().cuda().eval()
+        model = WanModelWithMemory.from_wan_model(
+            base, memory_layers=[0, 1], max_memory_size=4
+        ).cuda().eval()
+
+        pose_emb = torch.randn(dim, device='cuda')
+        semantic_key = model.get_semantic_key(pose_emb)
+
+        assert semantic_key.shape == (dim,), \
+            f"expected ({dim},), got {semantic_key.shape}"
+        assert semantic_key.requires_grad is False, \
+            "get_semantic_key should return detached tensor (no_grad)"
+        # 注意：@torch.no_grad() 不移动 tensor 到 CPU，所以不检查设备
+
+        logger.info("[PASS] test_three_tier_get_semantic_key_shape")
+    except Exception as e:
+        logger.error(f"[FAIL] test_three_tier_get_semantic_key_shape: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -725,12 +1084,20 @@ def main():
     test_memory_cross_attention_forward_signature()
     test_model_with_memory_imports_and_constants()
 
+    # ThreeTierMemoryBank 测试（CPU）
+    test_short_term_bank_fifo()
+    test_medium_term_bank_surprise_eviction()
+    test_long_term_bank_novelty_check()
+    test_three_tier_retrieve_budget()
+    test_three_tier_get_stats()
+
     # CUDA 测试（自动跳过）
     test_memory_cross_attention_shapes()
     test_memory_cross_attention_no_memory_change()
     test_memory_block_wrapper_shapes()
     test_wan_model_with_memory_conversion()
     test_get_projected_frame_embs_shape()
+    test_three_tier_get_semantic_key_shape()
 
     logger.info("All smoke tests completed.")
 
