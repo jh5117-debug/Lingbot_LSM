@@ -29,7 +29,7 @@ WIDTH=832
 NFP_LOSS_WEIGHT=0.1
 ACTION_DIM=8
 
-CUDA_VISIBLE_DEVICES="0,1,2,3"
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"
 
 # ============================================================
 # 以下内容通常无需修改
