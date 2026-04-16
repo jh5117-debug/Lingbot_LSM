@@ -1020,7 +1020,12 @@ def main():
             # C-1 fix: 多卡场景下广播 rank=0 检索结果给所有 rank
             # 这处理 M-4 广播为 None（模型非 WanModelWithMemory 或无 pose 数据）时的退化路径
             if world_size > 1 and dist.is_initialized():
-                _c1_payload = [(memory_states, memory_value_states_clip) if memory_states is not None else None]
+                # broadcast_object_list 要求 CPU tensor，广播前移至 CPU，接收后移回 device
+                _c1_obj = (
+                    (memory_states.cpu(), memory_value_states_clip.cpu())
+                    if memory_states is not None else None
+                )
+                _c1_payload = [_c1_obj]
                 dist.broadcast_object_list(_c1_payload, src=0)
                 if _c1_payload[0] is not None:
                     _c1_ms, _c1_mv = _c1_payload[0]

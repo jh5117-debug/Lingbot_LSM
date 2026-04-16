@@ -857,7 +857,10 @@ class ThreeTierMemoryBank:
 
         Args:
             query_pose_emb:     [dim=5120] 当前帧的 pose embedding
-            query_semantic_key: [dim=5120] 语义检索 key（可为 None，退化为 pose_emb 检索）
+            query_semantic_key: [dim=5120] 语义检索 key。
+                                为 None 时：LongTermBank 退化为 pose_emb cosine_sim 检索；
+                                LongTermBank.update() 跳过 novelty check，仅做 stability 检查。
+                                bank.size()==0 时无需计算 query_semantic_key（不会调用 retrieve）。
             short_n:            从 ShortTermBank 取的帧数上限（默认 2，即全部）
             medium_k:           从 MediumTermBank 取的帧数（默认 3）
             long_k:             从 LongTermBank 取的帧数（默认 2）

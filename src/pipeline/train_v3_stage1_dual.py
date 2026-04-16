@@ -1011,6 +1011,8 @@ def multi_clip_training_step(
                 hook_handle_ctx.remove()
 
             # 7. 从 hook 捕获的 hidden_states 用 NFPHead 计算 clip-level surprise
+            # NOTE: 使用 clip-level surprise（一个 clip 共享同一分数）与 infer_v3.py
+            # _update_memory_bank_v3 的 NFPHead 主路径对齐（per-frame cosine 为推理降级路径）
             clip_surprise = 0.4   # 默认 surprise（若 hook 未捕获）
             if "hs" in captured_hidden_states_ctx:
                 hidden_states_ctx = captured_hidden_states_ctx["hs"]  # [B, L, 5120]
