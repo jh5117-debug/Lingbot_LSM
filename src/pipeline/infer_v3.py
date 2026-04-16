@@ -1187,9 +1187,10 @@ def main():
                     )
                     if _m4_retrieved is not None:
                         _m4_k, _m4_v = _m4_retrieved   # 各 [K, 5120]，K ≤ 7
+                        assert _m4_k.shape[0] <= 7, f"M-4 broadcast: key_states 帧数 {_m4_k.shape[0]} 超过预算 7"
                         _m4_states = (
-                            _m4_k.unsqueeze(0),  # [1, K, dim]
-                            _m4_v.unsqueeze(0),  # [1, K, dim]
+                            _m4_k.unsqueeze(0).cpu(),  # [1, K, dim]，HIGH-1 fix: .cpu() 避免 pickle CUDA tensor
+                            _m4_v.unsqueeze(0).cpu(),  # [1, K, dim]，HIGH-1 fix: .cpu() 避免 pickle CUDA tensor
                         )
                     else:
                         _m4_states = None

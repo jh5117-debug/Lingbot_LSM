@@ -931,7 +931,10 @@ def multi_clip_training_step(
             seq_len = lat_f * lat_h * lat_w // (trainer.patch_size[1] * trainer.patch_size[2])
 
             # 2. prepare_control_signal
+            assert not torch.is_grad_enabled(), "context clip 不应有梯度（no_grad 失效）"
             context = trainer.encode_text(prompt)
+            # M-2 fix: encode_text 可能返回 float32，model forward 期望 bfloat16（与 target clip line 1084 对称）
+            context = [c.to(torch.bfloat16) if hasattr(c, 'dtype') and c.dtype != torch.bfloat16 else c for c in context]
             y = trainer.prepare_y(video, video_latent)
             dit_cond_dict = trainer.prepare_control_signal(
                 poses, actions, intrinsics, h, w, lat_f, lat_h, lat_w
