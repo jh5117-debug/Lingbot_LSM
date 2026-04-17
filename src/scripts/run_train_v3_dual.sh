@@ -29,7 +29,7 @@ NUM_EPOCHS=5
 LEARNING_RATE=1e-4
 LR_DIT=1e-5
 WEIGHT_DECAY=0.01
-GRADIENT_ACCUMULATION_STEPS=8    # 4 GPU × 8 accum = effective batch 32
+GRADIENT_ACCUMULATION_STEPS=8    # 6 GPU × 8 accum = effective batch 48
 MAX_GRAD_NORM=1.0
 SAVE_EVERY_N_EPOCHS=1
 KEEP_LAST_N_CHECKPOINTS=2     # 只保留最近 2 个 checkpoint，第 3 个存下来时自动删第 1 个
@@ -98,7 +98,6 @@ TRAIN_ARGS=(
     --dataset_dir                 "${DATASET_DIR}"
     --output_dir                  "${OUTPUT_DIR}"
     --stage                       1
-    --num_epochs                  "${NUM_EPOCHS}"
     --learning_rate               "${LEARNING_RATE}"
     --lr_dit                      "${LR_DIT}"
     --weight_decay                "${WEIGHT_DECAY}"
@@ -146,48 +145,89 @@ echo "  LOG_FILE           : ${LOG_FILE}"
 echo "====================================================="
 
 # ============================================================
-# Step 1/2: 训练 low_noise_model
+# Step 1/2: 训练 low_noise_model（每 epoch 独立启动 accelerate launch）
 # ============================================================
 echo ""
-echo "===== Step 1/2: 训练 low_noise_model（t < 0.947）====="
-CMD_LOW=(
-    accelerate launch "${COMMON_ARGS[@]}"
-    "${TRAIN_SCRIPT}"
-    "${TRAIN_ARGS[@]}"
-    --model_type low
-)
+echo "===== Step 1/2: 训练 low_noise_model（t < 0.947，per-epoch 子进程）====="
+
+_LOW_RESUME="${RESUME_FROM_LOW}"
+_LOW_START=1
 if [ -n "${RESUME_FROM_LOW}" ]; then
-    CMD_LOW+=(--resume "${RESUME_FROM_LOW}")
+    _ep=$(basename "${RESUME_FROM_LOW}" | sed 's/^epoch_//')
+    if ! echo "${_ep}" | grep -qE '^[0-9]+$'; then
+        echo "[ERROR] 无法从 RESUME_FROM_LOW 解析 epoch 编号，期望路径格式：.../epoch_N" >&2
+        exit 1
+    fi
+    _LOW_START=$((_ep + 1))
 fi
-echo "执行命令（low）："
-echo "${CMD_LOW[*]}"
+
+for _EPOCH in $(seq "${_LOW_START}" "${NUM_EPOCHS}"); do
+    echo ""
+    echo "----- low_noise_model Epoch ${_EPOCH}/${NUM_EPOCHS} -----"
+    CMD_LOW=(
+        accelerate launch "${COMMON_ARGS[@]}"
+        "${TRAIN_SCRIPT}"
+        "${TRAIN_ARGS[@]}"
+        --num_epochs "${_EPOCH}"
+        --model_type low
+    )
+    if [ -n "${_LOW_RESUME}" ]; then
+        CMD_LOW+=(--resume "${_LOW_RESUME}")
+    fi
+    echo "执行命令（low epoch ${_EPOCH}）："
+    echo "${CMD_LOW[*]}"
+    echo ""
+    "${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"; _EXIT="${PIPESTATUS[0]}"
+    if [ "${_EXIT}" -ne 0 ]; then
+        echo "[ERROR] low_noise_model Epoch ${_EPOCH} 训练失败，退出码 ${_EXIT}" >&2
+        exit "${_EXIT}"
+    fi
+    _LOW_RESUME="${OUTPUT_DIR}/low_noise_model/epoch_${_EPOCH}"
+done
+
 echo ""
-"${CMD_LOW[@]}" 2>&1 | tee -a "${LOG_FILE}"; _LOW_EXIT="${PIPESTATUS[0]}"
-if [ "${_LOW_EXIT}" -ne 0 ]; then
-    echo "[ERROR] low_noise_model 训练失败，退出码 ${_LOW_EXIT}" >&2
-    exit "${_LOW_EXIT}"
-fi
-echo ""
-echo "===== low_noise_model 训练完成 ====="
+echo "===== low_noise_model 训练完成（${NUM_EPOCHS} epochs）====="
 
 # ============================================================
-# Step 2/2: 训练 high_noise_model
+# Step 2/2: 训练 high_noise_model（每 epoch 独立启动 accelerate launch）
 # ============================================================
 echo ""
-echo "===== Step 2/2: 训练 high_noise_model（t >= 0.947）====="
-CMD_HIGH=(
-    accelerate launch "${COMMON_ARGS[@]}"
-    "${TRAIN_SCRIPT}"
-    "${TRAIN_ARGS[@]}"
-    --model_type high
-)
+echo "===== Step 2/2: 训练 high_noise_model（t >= 0.947，per-epoch 子进程）====="
+
+_HIGH_RESUME="${RESUME_FROM_HIGH}"
+_HIGH_START=1
 if [ -n "${RESUME_FROM_HIGH}" ]; then
-    CMD_HIGH+=(--resume "${RESUME_FROM_HIGH}")
+    _ep=$(basename "${RESUME_FROM_HIGH}" | sed 's/^epoch_//')
+    if ! echo "${_ep}" | grep -qE '^[0-9]+$'; then
+        echo "[ERROR] 无法从 RESUME_FROM_HIGH 解析 epoch 编号，期望路径格式：.../epoch_N" >&2
+        exit 1
+    fi
+    _HIGH_START=$((_ep + 1))
 fi
-echo "执行命令（high）："
-echo "${CMD_HIGH[*]}"
-echo ""
-"${CMD_HIGH[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
+
+for _EPOCH in $(seq "${_HIGH_START}" "${NUM_EPOCHS}"); do
+    echo ""
+    echo "----- high_noise_model Epoch ${_EPOCH}/${NUM_EPOCHS} -----"
+    CMD_HIGH=(
+        accelerate launch "${COMMON_ARGS[@]}"
+        "${TRAIN_SCRIPT}"
+        "${TRAIN_ARGS[@]}"
+        --num_epochs "${_EPOCH}"
+        --model_type high
+    )
+    if [ -n "${_HIGH_RESUME}" ]; then
+        CMD_HIGH+=(--resume "${_HIGH_RESUME}")
+    fi
+    echo "执行命令（high epoch ${_EPOCH}）："
+    echo "${CMD_HIGH[*]}"
+    echo ""
+    "${CMD_HIGH[@]}" 2>&1 | tee -a "${LOG_FILE}"; _EXIT="${PIPESTATUS[0]}"
+    if [ "${_EXIT}" -ne 0 ]; then
+        echo "[ERROR] high_noise_model Epoch ${_EPOCH} 训练失败，退出码 ${_EXIT}" >&2
+        exit "${_EXIT}"
+    fi
+    _HIGH_RESUME="${OUTPUT_DIR}/high_noise_model/epoch_${_EPOCH}"
+done
 
 echo ""
 echo "===== 双模型训练完成 ====="
