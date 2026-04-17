@@ -53,7 +53,7 @@ HYBRID_MEDIUM_K=3          # 混合检索预算中 Medium 层 top-K
 HYBRID_LONG_K=2            # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95         # cross-tier dedup 阈值（pose_emb cosine_sim > 阈值则去重）
 
-CUDA_VISIBLE_DEVICES="0,1,2,3"
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"
 
 # ============================================================
 # 以下内容通常无需修改
