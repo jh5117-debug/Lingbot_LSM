@@ -31,7 +31,8 @@ LR_DIT=1e-5
 WEIGHT_DECAY=0.01
 GRADIENT_ACCUMULATION_STEPS=8    # 4 GPU × 8 accum = effective batch 32
 MAX_GRAD_NORM=1.0
-SAVE_EVERY_N_EPOCHS=5
+SAVE_EVERY_N_EPOCHS=1
+KEEP_LAST_N_CHECKPOINTS=2     # 只保留最近 2 个 checkpoint，第 3 个存下来时自动删第 1 个
 DATASET_REPEAT=1
 NUM_FRAMES=81
 HEIGHT=480
@@ -104,6 +105,7 @@ TRAIN_ARGS=(
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
     --max_grad_norm               "${MAX_GRAD_NORM}"
     --save_every_n_epochs         "${SAVE_EVERY_N_EPOCHS}"
+    --keep_last_n_checkpoints     "${KEEP_LAST_N_CHECKPOINTS}"
     --dataset_repeat              "${DATASET_REPEAT}"
     --num_frames                  "${NUM_FRAMES}"
     --height                      "${HEIGHT}"

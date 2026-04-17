@@ -1228,6 +1228,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
+    parser.add_argument("--keep_last_n_checkpoints", type=int, default=0,
+                        help="保留最近 N 个 epoch checkpoint，0=全部保留")
     parser.add_argument("--save_steps", type=int, default=None,
                         help="每 N steps 保存一次（None = 只按 epoch 保存）")
     parser.add_argument("--dataset_repeat", type=int, default=1)
@@ -1545,6 +1547,13 @@ def main():
                         if os.path.isdir(prev_state_dir):
                             shutil.rmtree(prev_state_dir)
                             logging.info(f"Auto-deleted old training_state: {prev_state_dir}")
+                    if args.keep_last_n_checkpoints > 0:
+                        old_epoch_num = epoch + 1 - args.keep_last_n_checkpoints * args.save_every_n_epochs
+                        if old_epoch_num >= 1:
+                            old_ckpt_dir = os.path.join(args.output_dir, f"epoch_{old_epoch_num}")
+                            if os.path.isdir(old_ckpt_dir):
+                                shutil.rmtree(old_ckpt_dir)
+                                logging.info(f"Auto-deleted old checkpoint: {old_ckpt_dir}")
 
             if args.dry_run:
                 break
