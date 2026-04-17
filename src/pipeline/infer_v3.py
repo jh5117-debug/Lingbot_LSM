@@ -877,6 +877,17 @@ def main():
             "Use --ulysses_size to set it, or run single-GPU."
         )
 
+    # Ulysses SP 要求 num_heads 能被 ulysses_size 整除
+    if args.ulysses_size > 1:
+        _num_heads = cfg.num_heads
+        if _num_heads % args.ulysses_size != 0:
+            _valid = sorted(i for i in range(1, _num_heads + 1) if _num_heads % i == 0)
+            raise ValueError(
+                f"Ulysses SP requires num_heads ({_num_heads}) % ulysses_size "
+                f"({args.ulysses_size}) == 0. "
+                f"Valid GPU counts: {_valid}"
+            )
+
     # 创建 ThreeTierMemoryBank（使用 CLI 参数，全量超参数暴露）
     bank = ThreeTierMemoryBank(
         short_cap=args.short_cap,
@@ -1004,7 +1015,7 @@ def main():
                 retrieved = bank.retrieve(
                     query_pose_emb=query_emb,
                     query_semantic_key=query_semantic_key,  # v3 新增
-                    short_n=2,
+                    short_n=args.short_cap,
                     medium_k=args.hybrid_medium_k,
                     long_k=args.hybrid_long_k,
                     device=device,
@@ -1180,7 +1191,7 @@ def main():
                     _m4_retrieved = bank.retrieve(
                         query_pose_emb=_m4_q,
                         query_semantic_key=_m4_query_sk,
-                        short_n=2,
+                        short_n=args.short_cap,
                         medium_k=args.hybrid_medium_k,
                         long_k=args.hybrid_long_k,
                         device=device,

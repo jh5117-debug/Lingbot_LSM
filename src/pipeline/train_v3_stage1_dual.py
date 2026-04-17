@@ -952,7 +952,7 @@ def multi_clip_training_step(
                 retrieved_ctx = bank.retrieve(
                     query_emb_ctx,
                     query_semantic_key=query_semantic_key_ctx,
-                    short_n=2,
+                    short_n=args.short_cap,
                     medium_k=args.hybrid_medium_k,
                     long_k=args.hybrid_long_k,
                     device=device,
@@ -1105,7 +1105,7 @@ def multi_clip_training_step(
         retrieved = bank.retrieve(
             query_emb,
             query_semantic_key=query_semantic_key,
-            short_n=2,
+            short_n=args.short_cap,
             medium_k=args.hybrid_medium_k,
             long_k=args.hybrid_long_k,
             device=device,
