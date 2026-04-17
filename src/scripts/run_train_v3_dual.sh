@@ -16,7 +16,7 @@ set -euo pipefail
 #   - 新增全量 ThreeTierMemoryBank 超参数（10 个）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
-DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3_8ch"   # v3 数据集目录
+DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"   # v3 数据集目录
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v3_stage1_dual"
 RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
