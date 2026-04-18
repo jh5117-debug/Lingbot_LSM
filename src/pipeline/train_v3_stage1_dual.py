@@ -1510,8 +1510,18 @@ def main():
             logging.info(f"Resumed model weights from {ckpt_file}")
 
         if os.path.exists(training_state_dir):
-            accelerator.load_state(training_state_dir)
-            logging.info(f"Resumed optimizer/scheduler from {training_state_dir}")
+            try:
+                accelerator.load_state(training_state_dir)
+                logging.info(f"Resumed optimizer/scheduler from {training_state_dir}")
+            except Exception as e:
+                # ZeRO-2 保存的 training_state 在 ZeRO-3 下文件格式不兼容，
+                # DeepSpeed 找不到分片文件会触发 AssertionError。
+                # 模型权重已在上方正确加载，optimizer 从零热身影响可忽略。
+                logging.warning(
+                    f"Skipping optimizer/scheduler state load from {training_state_dir} "
+                    f"(ZeRO stage mismatch or missing files): {e}. "
+                    "Model weights loaded. Optimizer/scheduler will start fresh."
+                )
 
         if os.path.exists(metadata_file):
             import json
