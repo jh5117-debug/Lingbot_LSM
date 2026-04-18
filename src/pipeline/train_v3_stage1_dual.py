@@ -1492,7 +1492,17 @@ def main():
         if os.path.exists(ckpt_file):
             state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
             unwrapped = accelerator.unwrap_model(model)
-            missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
+            # ZeRO-3 将参数分片存储，直接 load_state_dict 会写入错误分片；
+            # GatheredParameters 临时汇聚所有 GPU 的分片 → 写入完整权重 → 重新分片。
+            # ZeRO-2 下 GatheredParameters 是 no-op，兼容两种配置。
+            try:
+                import deepspeed
+                with deepspeed.zero.GatheredParameters(
+                    list(unwrapped.parameters()), modifier_rank=0
+                ):
+                    missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
+            except (ImportError, AttributeError):
+                missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
             if missing:
                 logging.warning(f"Resume: missing keys ({len(missing)}): {missing[:5]}")
             if unexpected:
