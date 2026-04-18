@@ -589,6 +589,31 @@ def enable_gradient_checkpointing(model: nn.Module) -> int:
     return patched
 
 
+def _reset_deepspeed_zero_state(accelerator) -> None:
+    """Reset DeepSpeed ZeRO stage-1/2 internal reduce state after a mid-backward OOM.
+
+    When backward() raises OOM, ZeRO gradient hooks may have already marked some
+    parameters as reduced (params_already_reduced[i] = True) and partially filled
+    the IPG bucket.  optimizer.zero_grad() clears gradient tensors but does NOT
+    touch this internal bookkeeping, so the next backward hits:
+        AssertionError: The parameter X has already been reduced.
+    This function resets that bookkeeping so the next backward starts clean.
+    """
+    if not (hasattr(accelerator, "deepspeed_engine_wrapped")
+            and accelerator.deepspeed_engine_wrapped is not None):
+        return
+    zero_optim = getattr(accelerator.deepspeed_engine_wrapped.engine, "optimizer", None)
+    if zero_optim is None:
+        return
+    if hasattr(zero_optim, "params_already_reduced"):
+        zero_optim.params_already_reduced[:] = [False] * len(zero_optim.params_already_reduced)
+    for attr in ("ipg_bucket", "grads_in_ipg_bucket", "params_in_ipg_bucket"):
+        if hasattr(zero_optim, attr):
+            setattr(zero_optim, attr, [])
+    if hasattr(zero_optim, "elements_in_ipg_bucket"):
+        zero_optim.elements_in_ipg_bucket = 0
+
+
 # ============================================================
 # Trainer（主训练器）
 # ============================================================
@@ -1533,6 +1558,7 @@ def main():
                         optimizer.zero_grad()
                 except torch.cuda.OutOfMemoryError:
                     optimizer.zero_grad(set_to_none=True)
+                    _reset_deepspeed_zero_state(accelerator)
                     torch.cuda.empty_cache()
                     gc.collect()
                     _back_skip[0] = 1.0
