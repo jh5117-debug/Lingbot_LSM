@@ -1554,6 +1554,13 @@ def main():
                     )
                     continue
 
+                # 反向传播前主动释放缓存，防止 batch 1 backward 后 averaged_gradients
+                # 分配导致后续 batch 的 gradient checkpoint recomputation OOM。
+                # 注：此调用在 d249643 中被错误移除（原因是 AssertionError，但真正原因是
+                # averaged_gradients 未清理），现恢复。
+                gc.collect()
+                torch.cuda.empty_cache()
+
                 # backward OOM guard（DDP-safe）
                 # 全部 rank 在 gradient checkpoint recomputation 阶段同时 OOM →
                 # 无 ALLREDUCE 参与，可安全捕获后 all_reduce 跳过标志。
@@ -1581,7 +1588,12 @@ def main():
                             )
                         optimizer.zero_grad()
                 except torch.cuda.OutOfMemoryError:
+                    # detach_() 切断 autograd 图，确保 C++ 级别的 backward 函数引用被释放，
+                    # 防止多次 OOM 后 ZeRO params_already_reduced 被 lingering hook 再次置 True
+                    if loss is not None:
+                        loss.detach_()
                     del loss
+                    torch.cuda.synchronize()  # 冲刷残留 CUDA 操作，避免 NCCL 与释放竞争
                     optimizer.zero_grad(set_to_none=True)
                     _reset_deepspeed_zero_state(accelerator, optimizer)
                     torch.cuda.empty_cache()
