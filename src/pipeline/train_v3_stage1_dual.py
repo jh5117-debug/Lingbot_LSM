@@ -621,11 +621,17 @@ def _reset_deepspeed_zero_state(accelerator, optimizer=None) -> None:
         n = len(cand.params_already_reduced)
         for i in range(n):
             cand.params_already_reduced[i] = False
-        for attr in ("ipg_bucket", "grads_in_ipg_bucket", "params_in_ipg_bucket"):
+        for attr in ("ipg_bucket", "grads_in_ipg_bucket", "params_in_ipg_bucket",
+                     "extra_large_params_truncated", "extra_large_param_grads",
+                     "previous_reduce_events", "reduce_scatter_gradients_remaining_events"):
             if hasattr(cand, attr):
                 setattr(cand, attr, [])
         if hasattr(cand, "elements_in_ipg_bucket"):
             cand.elements_in_ipg_bucket = 0
+        # micro_step_id 追踪梯度累积边界；OOM 后 reset 避免 sync/non-sync 混乱
+        # 导致同一 backward 内 double-reduce AssertionError
+        if hasattr(cand, "micro_step_id"):
+            cand.micro_step_id = -1
         # Clear averaged_gradients: stale partial gradients from failed backwards
         # corrupt ZeRO's state machine (causing double-reduce AssertionError) and
         # keep ~1.7 GB allocated that prevents the next backward's recomputation.
@@ -1584,9 +1590,12 @@ def main():
                                 lr=lr_scheduler.get_last_lr()[0],
                             )
                         optimizer.zero_grad()
-                except torch.cuda.OutOfMemoryError:
-                    # detach_() 切断 autograd 图，确保 C++ 级别的 backward 函数引用被释放，
-                    # 防止多次 OOM 后 ZeRO params_already_reduced 被 lingering hook 再次置 True
+                except (torch.cuda.OutOfMemoryError, AssertionError) as _bwd_exc:
+                    # AssertionError "already been reduced" = ZeRO micro_step_id 混乱导致
+                    # double-reduce，与 OOM 同源（多次失败后状态机累积残留），统一做 ZeRO reset。
+                    # 若是其他 AssertionError（代码 bug）则重新抛出。
+                    if isinstance(_bwd_exc, AssertionError) and "already been reduced" not in str(_bwd_exc):
+                        raise
                     if loss is not None:
                         loss.detach_()
                     del loss
