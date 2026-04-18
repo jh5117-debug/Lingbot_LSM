@@ -1497,6 +1497,14 @@ def main():
                     )
                     continue
 
+                # Release PyTorch allocator cache before backward to free
+                # headroom for gradient checkpointing recomputation.
+                # GC forward pass frees activations into PyTorch cache; calling
+                # empty_cache() here returns that pool (~889 MiB observed) to
+                # CUDA so backward recomputation tensors can be allocated.
+                gc.collect()
+                torch.cuda.empty_cache()
+
                 with accelerator.accumulate(model):
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
