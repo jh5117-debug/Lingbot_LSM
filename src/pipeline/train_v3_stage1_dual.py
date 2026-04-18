@@ -589,7 +589,7 @@ def enable_gradient_checkpointing(model: nn.Module) -> int:
     return patched
 
 
-def _reset_deepspeed_zero_state(accelerator) -> None:
+def _reset_deepspeed_zero_state(accelerator, optimizer=None) -> None:
     """Reset DeepSpeed ZeRO stage-1/2 internal reduce state after a mid-backward OOM.
 
     When backward() raises OOM, ZeRO gradient hooks may have already marked some
@@ -597,21 +597,42 @@ def _reset_deepspeed_zero_state(accelerator) -> None:
     the IPG bucket.  optimizer.zero_grad() clears gradient tensors but does NOT
     touch this internal bookkeeping, so the next backward hits:
         AssertionError: The parameter X has already been reduced.
-    This function resets that bookkeeping so the next backward starts clean.
+    This function tries multiple paths to find the ZeRO optimizer and resets it.
     """
-    if not (hasattr(accelerator, "deepspeed_engine_wrapped")
-            and accelerator.deepspeed_engine_wrapped is not None):
+    candidates = []
+    # Try the caller-supplied optimizer first (most direct path)
+    if optimizer is not None:
+        candidates.append(optimizer)
+        if hasattr(optimizer, "optimizer"):
+            candidates.append(optimizer.optimizer)
+    # Try through the accelerator's DeepSpeed engine
+    if hasattr(accelerator, "deepspeed_engine_wrapped") and accelerator.deepspeed_engine_wrapped is not None:
+        eng = getattr(accelerator.deepspeed_engine_wrapped, "engine", None)
+        if eng is not None:
+            zero_opt = getattr(eng, "optimizer", None)
+            if zero_opt is not None:
+                candidates.append(zero_opt)
+                if hasattr(zero_opt, "optimizer"):
+                    candidates.append(zero_opt.optimizer)
+
+    for cand in candidates:
+        if not hasattr(cand, "params_already_reduced"):
+            continue
+        n = len(cand.params_already_reduced)
+        for i in range(n):
+            cand.params_already_reduced[i] = False
+        for attr in ("ipg_bucket", "grads_in_ipg_bucket", "params_in_ipg_bucket"):
+            if hasattr(cand, attr):
+                setattr(cand, attr, [])
+        if hasattr(cand, "elements_in_ipg_bucket"):
+            cand.elements_in_ipg_bucket = 0
+        logging.info(f"DeepSpeed ZeRO state reset: {n} params cleared via {type(cand).__name__}")
         return
-    zero_optim = getattr(accelerator.deepspeed_engine_wrapped.engine, "optimizer", None)
-    if zero_optim is None:
-        return
-    if hasattr(zero_optim, "params_already_reduced"):
-        zero_optim.params_already_reduced[:] = [False] * len(zero_optim.params_already_reduced)
-    for attr in ("ipg_bucket", "grads_in_ipg_bucket", "params_in_ipg_bucket"):
-        if hasattr(zero_optim, attr):
-            setattr(zero_optim, attr, [])
-    if hasattr(zero_optim, "elements_in_ipg_bucket"):
-        zero_optim.elements_in_ipg_bucket = 0
+
+    logging.warning(
+        "_reset_deepspeed_zero_state: ZeRO optimizer not found — "
+        "params_already_reduced NOT reset; next backward may AssertionError"
+    )
 
 
 # ============================================================
@@ -1018,24 +1039,25 @@ def multi_clip_training_step(
 
             try:
                 # 6. Forward with no_grad（context clip 不参与反传）
-                sigma_ctx, t_ctx, _ = trainer.schedule.sample_timestep(
-                    model_type=args.model_type
-                )
-                t_ctx = t_ctx.to(device).unsqueeze(0)
-                noise_ctx = torch.randn_like(video_latent)
-                noisy_latent_ctx = (1.0 - sigma_ctx) * video_latent + sigma_ctx * noise_ctx
-
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    _ = model(
-                        [noisy_latent_ctx],
-                        t=t_ctx,
-                        context=context,
-                        seq_len=seq_len,
-                        y=[y],
-                        dit_cond_dict=dit_cond_dict,
-                        memory_states=memory_states_ctx,
-                        memory_value_states=memory_value_states_ctx,
+                with torch.no_grad():
+                    sigma_ctx, t_ctx, _ = trainer.schedule.sample_timestep(
+                        model_type=args.model_type
                     )
+                    t_ctx = t_ctx.to(device).unsqueeze(0)
+                    noise_ctx = torch.randn_like(video_latent)
+                    noisy_latent_ctx = (1.0 - sigma_ctx) * video_latent + sigma_ctx * noise_ctx
+
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        _ = model(
+                            [noisy_latent_ctx],
+                            t=t_ctx,
+                            context=context,
+                            seq_len=seq_len,
+                            y=[y],
+                            dit_cond_dict=dit_cond_dict,
+                            memory_states=memory_states_ctx,
+                            memory_value_states=memory_value_states_ctx,
+                        )
             finally:
                 hook_handle_ctx.remove()
 
@@ -1557,8 +1579,9 @@ def main():
                             )
                         optimizer.zero_grad()
                 except torch.cuda.OutOfMemoryError:
+                    del loss
                     optimizer.zero_grad(set_to_none=True)
-                    _reset_deepspeed_zero_state(accelerator)
+                    _reset_deepspeed_zero_state(accelerator, optimizer)
                     torch.cuda.empty_cache()
                     gc.collect()
                     _back_skip[0] = 1.0
