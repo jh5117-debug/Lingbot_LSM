@@ -1544,14 +1544,6 @@ def main():
                     )
                     continue
 
-                # Release PyTorch allocator cache before backward to free
-                # headroom for gradient checkpointing recomputation.
-                # GC forward pass frees activations into PyTorch cache; calling
-                # empty_cache() here returns that pool (~889 MiB observed) to
-                # CUDA so backward recomputation tensors can be allocated.
-                gc.collect()
-                torch.cuda.empty_cache()
-
                 # backward OOM guard（DDP-safe）
                 # 全部 rank 在 gradient checkpoint recomputation 阶段同时 OOM →
                 # 无 ALLREDUCE 参与，可安全捕获后 all_reduce 跳过标志。
