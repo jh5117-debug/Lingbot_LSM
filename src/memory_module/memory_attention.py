@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 # ---- sys.path（供 forward 内懒加载 flash_attention 使用）----
@@ -42,18 +43,28 @@ logger = logging.getLogger(__name__)
 
 
 class RMSNorm(nn.Module):
-    """轻量 RMSNorm，不依赖 lingbot-world 内部类。"""
+    """轻量 RMSNorm，不依赖 lingbot-world 内部类。
+
+    优先使用 F.rms_norm（PyTorch ≥ 2.4 fused kernel，不在 global memory 中
+    实体化 float32 张量），避免 gradient checkpoint recomputation 时 OOM。
+    fallback 实现去掉命名 float32 张量，最终乘法在 bfloat16 完成以节省内存。
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._use_fused = hasattr(F, 'rms_norm')
 
     def forward(self, x: Tensor) -> Tensor:
-        # 在 float32 下计算，避免 bfloat16 精度问题
-        x_f32 = x.float()
-        norm = x_f32.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x_f32 * norm * self.weight).to(x.dtype)
+        if self._use_fused:
+            # fused kernel：不在 global memory 中实体化 float32 张量
+            return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
+        # fallback：norm scalar 在 float32 计算后立即投影回 x.dtype，
+        # 最终乘法在 bfloat16（160 MiB）而非 float32（320 MiB）完成，
+        # 且不命名 float32 临时张量，Python 可在 .mean() 后提前释放。
+        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * norm.to(x.dtype) * self.weight
 
 
 class MemoryCrossAttention(nn.Module):

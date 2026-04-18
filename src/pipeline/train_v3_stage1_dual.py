@@ -1505,27 +1505,46 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                with accelerator.accumulate(model):
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        # 与 v2_dual H-2 修复对齐：使用 accelerator-prepared model.parameters()
-                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    if accelerator.sync_gradients:
-                        lr_scheduler.step()
-                    # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
-                    if wb_logger is not None and accelerator.sync_gradients:
-                        _loss_dict = {
-                            "loss/total": loss.item(),
-                            "loss/diffusion": loss.item(),
-                        }
-                        wb_logger.log_step(
-                            global_step + 1,
-                            _loss_dict,
-                            model=accelerator.unwrap_model(model),
-                            lr=lr_scheduler.get_last_lr()[0],
-                        )
-                    optimizer.zero_grad()
+                # backward OOM guard（DDP-safe）
+                # 全部 rank 在 gradient checkpoint recomputation 阶段同时 OOM →
+                # 无 ALLREDUCE 参与，可安全捕获后 all_reduce 跳过标志。
+                _back_skip = torch.zeros(1, device=accelerator.device)
+                try:
+                    with accelerator.accumulate(model):
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            # 与 v2_dual H-2 修复对齐：使用 accelerator-prepared model.parameters()
+                            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        optimizer.step()
+                        if accelerator.sync_gradients:
+                            lr_scheduler.step()
+                        # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
+                        if wb_logger is not None and accelerator.sync_gradients:
+                            _loss_dict = {
+                                "loss/total": loss.item(),
+                                "loss/diffusion": loss.item(),
+                            }
+                            wb_logger.log_step(
+                                global_step + 1,
+                                _loss_dict,
+                                model=accelerator.unwrap_model(model),
+                                lr=lr_scheduler.get_last_lr()[0],
+                            )
+                        optimizer.zero_grad()
+                except torch.cuda.OutOfMemoryError:
+                    optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    _back_skip[0] = 1.0
+
+                if accelerator.num_processes > 1:
+                    dist.all_reduce(_back_skip, op=dist.ReduceOp.MAX)
+
+                if _back_skip.item() > 0:
+                    logger.warning(
+                        f"OOM (backward recompute) at step {global_step}. Skipping batch."
+                    )
+                    continue
 
                 epoch_loss += loss.item()
                 num_batches += 1
