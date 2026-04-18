@@ -1554,14 +1554,11 @@ def main():
                     )
                     continue
 
-                # 反向传播前主动释放缓存，防止 batch 1 backward 后 averaged_gradients
-                # 分配导致后续 batch 的 gradient checkpoint recomputation OOM。
-                # 注：此调用在 d249643 中被错误移除（原因是 AssertionError，但真正原因是
-                # averaged_gradients 未清理），现恢复。
-                gc.collect()
-                torch.cuda.empty_cache()
-
                 # backward OOM guard（DDP-safe）
+                # 注：不在此处调用 empty_cache()。d249643 曾加入该调用，041063d 证明它会
+                # 把 PyTorch allocator cache 返还给 CUDA，导致 backward recompute 申请
+                # 新的连续内存时触发 allocator fragmentation，造成系统性每 batch 必 OOM。
+                # averaged_gradients 的清理已在 _reset_deepspeed_zero_state 中处理。
                 # 全部 rank 在 gradient checkpoint recomputation 阶段同时 OOM →
                 # 无 ALLREDUCE 参与，可安全捕获后 all_reduce 跳过标志。
                 _back_skip = torch.zeros(1, device=accelerator.device)
