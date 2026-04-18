@@ -626,6 +626,16 @@ def _reset_deepspeed_zero_state(accelerator, optimizer=None) -> None:
                 setattr(cand, attr, [])
         if hasattr(cand, "elements_in_ipg_bucket"):
             cand.elements_in_ipg_bucket = 0
+        # Clear averaged_gradients: stale partial gradients from failed backwards
+        # corrupt ZeRO's state machine (causing double-reduce AssertionError) and
+        # keep ~1.7 GB allocated that prevents the next backward's recomputation.
+        if hasattr(cand, "averaged_gradients"):
+            avg_grads = cand.averaged_gradients
+            if isinstance(avg_grads, dict):
+                avg_grads.clear()
+            elif isinstance(avg_grads, list):
+                for i in range(len(avg_grads)):
+                    avg_grads[i] = None
         logging.info(f"DeepSpeed ZeRO state reset: {n} params cleared via {type(cand).__name__}")
         return
 
