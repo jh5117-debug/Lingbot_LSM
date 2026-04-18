@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -1465,43 +1466,58 @@ def main():
 
             for clips_batch in progress:
                 # clips_batch: List[dict] of N clips（来自 multi_clip_collate_fn）
-                # code_standards.md §2：OOM 防御
+                # code_standards.md §2：OOM 防御（DDP-safe）
+                # 先 forward 并同步 OOM 标志，确保所有 rank 一致决定跳过，避免 NCCL 死锁
+                _skip = torch.zeros(1, device=accelerator.device)
+                loss = None
                 try:
-                    with accelerator.accumulate(model):
-                        loss = multi_clip_training_step(
-                            trainer,
-                            accelerator.unwrap_model(model),
-                            clips_batch,
-                            args,
-                        )
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            # 与 v2_dual H-2 修复对齐：使用 accelerator-prepared model.parameters()
-                            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                        optimizer.step()
-                        if accelerator.sync_gradients:
-                            lr_scheduler.step()
-                        # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
-                        if wb_logger is not None and accelerator.sync_gradients:
-                            _loss_dict = {
-                                "loss/total": loss.item(),
-                                "loss/diffusion": loss.item(),
-                            }
-                            wb_logger.log_step(
-                                global_step + 1,
-                                _loss_dict,
-                                model=accelerator.unwrap_model(model),
-                                lr=lr_scheduler.get_last_lr()[0],
-                            )
-                        optimizer.zero_grad()
-
+                    loss = multi_clip_training_step(
+                        trainer,
+                        accelerator.unwrap_model(model),
+                        clips_batch,
+                        args,
+                    )
                 except torch.cuda.OutOfMemoryError:
+                    try:
+                        del loss
+                    except NameError:
+                        pass
+                    optimizer.zero_grad(set_to_none=True)
                     torch.cuda.empty_cache()
+                    gc.collect()
+                    _skip[0] = 1.0
+
+                # 在任何 backward collective 之前同步：任一 rank OOM → 全部跳过
+                if accelerator.num_processes > 1:
+                    dist.all_reduce(_skip, op=dist.ReduceOp.MAX)
+
+                if _skip.item() > 0:
                     logger.warning(
                         f"OOM at step {global_step}, batch_size=1. Skipping batch."
                     )
-                    optimizer.zero_grad()
                     continue
+
+                with accelerator.accumulate(model):
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        # 与 v2_dual H-2 修复对齐：使用 accelerator-prepared model.parameters()
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    if accelerator.sync_gradients:
+                        lr_scheduler.step()
+                    # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
+                    if wb_logger is not None and accelerator.sync_gradients:
+                        _loss_dict = {
+                            "loss/total": loss.item(),
+                            "loss/diffusion": loss.item(),
+                        }
+                        wb_logger.log_step(
+                            global_step + 1,
+                            _loss_dict,
+                            model=accelerator.unwrap_model(model),
+                            lr=lr_scheduler.get_last_lr()[0],
+                        )
+                    optimizer.zero_grad()
 
                 epoch_loss += loss.item()
                 num_batches += 1

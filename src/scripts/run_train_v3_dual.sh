@@ -19,7 +19,7 @@ CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"   # v3 数据集目录
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v3_stage1_dual"
-RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
+RESUME_FROM_LOW="/home/nvme02/wlx/Memory/outputs/train/v3_stage1_dual/low_noise_model/epoch_2"  # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
 LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调
