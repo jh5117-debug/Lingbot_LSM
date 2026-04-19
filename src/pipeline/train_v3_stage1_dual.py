@@ -547,7 +547,7 @@ def freeze_for_stage(model: nn.Module, stage: int, lora_rank: int) -> list:
 # ============================================================
 
 def enable_gradient_checkpointing(model: nn.Module) -> int:
-    """对每个 DiT block 启用梯度检查点（ZeRO-3 兼容版）。"""
+    """对每个 DiT block 启用梯度检查点（ZeRO-3 兼容版，use_reentrant=True）。"""
     from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
     patched = 0
@@ -594,10 +594,11 @@ def enable_gradient_checkpointing(model: nn.Module) -> int:
                     finally:
                         _in_ckpt[0] = False
 
+                # use_reentrant=True: avoids check_recomputed_tensors_match which fails with ZeRO-3 in-place param release
                 return torch_checkpoint(
                     _run_via_module, x, e, seq_lens, grid_sizes, freqs,
                     context, context_lens, dit_cond_dict,
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
             return _ckpt_forward
 
