@@ -547,7 +547,7 @@ def freeze_for_stage(model: nn.Module, stage: int, lora_rank: int) -> list:
 # ============================================================
 
 def enable_gradient_checkpointing(model: nn.Module) -> int:
-    """对每个 DiT block 启用梯度检查点（与 v2_dual 完全对齐）。"""
+    """对每个 DiT block 启用梯度检查点（ZeRO-3 兼容版）。"""
     from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
     patched = 0
@@ -571,18 +571,37 @@ def enable_gradient_checkpointing(model: nn.Module) -> int:
             continue
         orig_forward = block.forward
 
-        def _make_ckpt_fn(fn):
+        def _make_ckpt_fn(module, fn):
+            # _in_ckpt prevents infinite recursion:
+            # _ckpt_forward → checkpoint(_run_via_module) → module() → _ckpt_forward → fn (direct)
+            # ZeRO-3 allgather pre-hook fires when module() is called, ensuring params are gathered
+            # during both the initial checkpoint forward and the backward recomputation.
+            _in_ckpt = [False]
+
             @wraps(fn)
             def _ckpt_forward(x, e, seq_lens, grid_sizes, freqs,
                               context, context_lens, dit_cond_dict=None):
+                if _in_ckpt[0]:
+                    return fn(x, e, seq_lens, grid_sizes, freqs,
+                              context, context_lens, dit_cond_dict)
+
+                def _run_via_module(x, e, seq_lens, grid_sizes, freqs,
+                                    context, context_lens, dit_cond_dict):
+                    _in_ckpt[0] = True
+                    try:
+                        return module(x, e, seq_lens, grid_sizes, freqs,
+                                      context, context_lens, dit_cond_dict)
+                    finally:
+                        _in_ckpt[0] = False
+
                 return torch_checkpoint(
-                    fn, x, e, seq_lens, grid_sizes, freqs,
+                    _run_via_module, x, e, seq_lens, grid_sizes, freqs,
                     context, context_lens, dit_cond_dict,
                     use_reentrant=False,
                 )
             return _ckpt_forward
 
-        block.forward = _make_ckpt_fn(orig_forward)
+        block.forward = _make_ckpt_fn(block, orig_forward)
         patched += 1
 
     logging.info(f"Gradient checkpointing: patched {patched} DiT blocks")
