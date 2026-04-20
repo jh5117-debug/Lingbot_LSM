@@ -107,6 +107,12 @@ class MemoryCrossAttention(nn.Module):
         # 参考 WorldMem dit.py L304 gate 机制；初始化为 0 保证训练初期 memory 分支无输出
         self.gate = nn.Parameter(torch.zeros(1))
 
+        # Innovation 10：Tier Embedding — 告知模型检索帧来自 Short/Medium/Long 层
+        # 0=Short（连续性锚点），1=Medium（动态事件），2=Long（稳定场景）
+        # 作用于 K，不影响 Q/V；tier_ids=None 时跳过（向后兼容 v3）
+        # 默认随机初始化（zero-init 不适合 Embedding）
+        self.tier_emb = nn.Embedding(3, dim)
+
         # 运行时诊断指标（非参数，供 WandBLogger._collect_memory_diagnostics 采集）
         self._last_attn_out_norm: float = 0.0
         self._last_gate_value: float = 0.0
@@ -117,11 +123,14 @@ class MemoryCrossAttention(nn.Module):
         memory_key_states: Tensor,
         memory_value_states: Optional[Tensor] = None,
         memory_lens: Tensor = None,
+        tier_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """
         MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
         签名从 forward(x, memory_states, memory_lens) 改为
               forward(x, memory_key_states, memory_value_states=None, memory_lens=None)
+
+        Innovation 10（Tier Embedding）新增 tier_ids 参数（2026-04-20）。
 
         Args:
             x:                    [B, L, dim]  当前帧序列（Query 来源）
@@ -130,6 +139,9 @@ class MemoryCrossAttention(nn.Module):
                                                若 None 则退化为 memory_key_states（向后兼容）
             memory_lens:          [B]          每个样本实际有效的 memory 帧数（用于 padding mask）
                                                若所有样本 memory 数相同可传 None
+            tier_ids:             [K] int64    每帧所属层的 ID（0=Short/1=Medium/2=Long）；
+                                               None 时跳过 tier embedding 叠加（向后兼容 v3）
+                                               (Innovation 10: Tier Embedding)
 
         Returns:
             out: [B, L, dim]  memory cross-attention 的输出（残差加法前）
@@ -160,6 +172,13 @@ class MemoryCrossAttention(nn.Module):
         q = self.norm_q(self.q(x)).view(B, L, self.num_heads, self.head_dim)
         k = self.norm_k(self.k(memory_key_states)).view(B, K, self.num_heads, self.head_dim)
         v = self.v(memory_value_states).view(B, K, self.num_heads, self.head_dim)
+
+        # Innovation 10：Tier Embedding — 在 K 上叠加 tier 嵌入，告知模型帧来自哪一层
+        # tier_ids=None 时跳过，保持向后兼容（v3 训练/推理路径不受影响）
+        if tier_ids is not None:
+            _tier_emb = self.tier_emb(tier_ids.to(x.device))           # [K, dim]
+            _tier_emb = _tier_emb.unsqueeze(0).expand(B, -1, -1)        # [B, K, dim]
+            k = k + _tier_emb.view(B, K, self.num_heads, self.head_dim)  # 叠加到 K
 
         # Flash Attention: [B, L, num_heads, head_dim]
         out = flash_attention(q, k, v, k_lens=memory_lens)

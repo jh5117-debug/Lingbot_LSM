@@ -848,8 +848,9 @@ class ThreeTierMemoryBank:
         medium_k: int = 3,
         long_k: int = 2,
         device: Optional[torch.device] = None,
-    ) -> Optional[Tuple[Tensor, Tensor]]:
-        """混合检索，返回去重后的 (key_states, value_states)。
+        return_tier_ids: bool = False,
+    ) -> Optional[Tuple[Tensor, ...]]:
+        """混合检索，返回去重后的 (key_states, value_states)，可选返回 tier_ids。
 
         检索预算：Short short_n 帧 + Medium top-medium_k + Long top-long_k。
         Cross-tier Dedup：移除 pose_emb cosine_sim > dup_threshold 的冗余帧。
@@ -865,9 +866,18 @@ class ThreeTierMemoryBank:
             medium_k:           从 MediumTermBank 取的帧数（默认 3）
             long_k:             从 LongTermBank 取的帧数（默认 2）
             device:             输出 tensor 放置的设备（None 则跟随 query_pose_emb.device）
+            return_tier_ids:    若 True，额外返回第三个张量 tier_ids [K] int64，
+                                其中 0=Short / 1=Medium / 2=Long（Innovation 10: Tier Embedding）；
+                                tier="" 时映射到 0。
+                                若 False（默认），行为与修改前完全一致，返回 Tuple[Tensor, Tensor]
+                                （向后兼容约束：v3 的 key_states, value_states = bank.retrieve(...) 不 break）
 
         Returns:
-            (pose_embs, visual_embs)：各 [K, 5120]，K ≤ short_n+medium_k+long_k（去重后可能更少）
+            若 return_tier_ids=False（默认）:
+                (pose_embs, visual_embs)：各 [K, 5120]，K ≤ short_n+medium_k+long_k（去重后可能更少）
+            若 return_tier_ids=True:
+                (pose_embs, visual_embs, tier_ids)：前两项同上；
+                tier_ids: [K] int64，0=Short / 1=Medium / 2=Long
             若合并后为空（bank 全空）返回 None
         """
         # 1. 收集各层帧
@@ -922,7 +932,17 @@ class ThreeTierMemoryBank:
             "ThreeTierMemoryBank.retrieve: short=%d medium=%d long=%d → selected=%d (after dedup)",
             len(short_frames), len(medium_frames), len(long_frames), len(selected_frames),
         )
-        return pose_embs, visual_embs
+
+        if not return_tier_ids:
+            # 向后兼容：v3 路径，不返回 tier_ids
+            return pose_embs, visual_embs
+
+        # Innovation 10：构建 tier_ids 张量（int64），对应 selected_frames 顺序
+        # 映射规则：short→0, medium→1, long→2, ""→0（默认）
+        _TIER_MAP = {"short": 0, "medium": 1, "long": 2}
+        tier_id_list = [_TIER_MAP.get(f.tier, 0) for f in selected_frames]
+        tier_ids = torch.tensor(tier_id_list, dtype=torch.long, device=device)  # [K]
+        return pose_embs, visual_embs, tier_ids
 
     def increment_age(self) -> None:
         """只对 MediumTermBank 帧 +1（Long/Short 不依赖 age decay）。

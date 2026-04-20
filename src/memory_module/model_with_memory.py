@@ -50,6 +50,9 @@ _MEMORY_STATES_KEY = "memory_states"
 # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
 # dit_cond_dict 中 memory value states 的 key（visual_emb 投影到模型空间，用作 cross-attn V）
 _MEMORY_VALUE_KEY = "__memory_value_states__"
+# Innovation 10: Tier Embedding — dit_cond_dict 中 tier_ids 的 key
+# tier_ids [K] int64，0=Short / 1=Medium / 2=Long；None 时 v3 向后兼容
+_TIER_IDS_KEY = "__tier_ids__"
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +115,9 @@ class MemoryBlockWrapper(nn.Module):
         if dit_cond_dict is not None and _MEMORY_STATES_KEY in dit_cond_dict:
             memory_key_states = dit_cond_dict[_MEMORY_STATES_KEY]        # [B, K, dim]，pose_emb
             memory_value_states = dit_cond_dict.get(_MEMORY_VALUE_KEY)   # [B, K, dim]，visual_emb；可 None
+            tier_ids = dit_cond_dict.get(_TIER_IDS_KEY)  # None 时 v3 向后兼容（Innovation 10）
             x = x + self.memory_cross_attn(
-                self.memory_norm(x), memory_key_states, memory_value_states
+                self.memory_norm(x), memory_key_states, memory_value_states, tier_ids=tier_ids
             )
 
         return x
@@ -186,11 +190,17 @@ class WanModelWithMemory(WanModel):
         # 作为 cross-attention 的 V（视觉内容嵌入）
         self.latent_proj = nn.Linear(self.out_dim, self.dim, bias=False)
 
+        # Innovation 9: Visual Feature Fusion — Semantic Key 融合视觉特征
+        # 将 visual_emb (latent_proj 输出, [dim]) 投影到 K 投影空间，与 pose_key 加权融合
+        self.visual_key_proj = nn.Linear(self.dim, self.dim, bias=False)
+
         logger.info(
             "WanModelWithMemory: wrapped %d blocks with MemoryBlockWrapper "
-            "(layers=%s), added NFPHead(dim=%d, z_dim=%d), latent_proj(%d→%d).",
+            "(layers=%s), added NFPHead(dim=%d, z_dim=%d), latent_proj(%d→%d), "
+            "visual_key_proj(%d→%d).",
             len(memory_layers), memory_layers, self.dim, self.out_dim,
             self.out_dim, self.dim,
+            self.dim, self.dim,
         )
 
     # ------------------------------------------------------------------
@@ -261,25 +271,45 @@ class WanModelWithMemory(WanModel):
         # 线性投影：[z_dim=16] → [dim=5120]
         return self.latent_proj(feat)  # [dim=5120]
 
-    @torch.no_grad()
-    def get_semantic_key(self, pose_emb: Tensor) -> Tensor:
+    def get_semantic_key(
+        self,
+        pose_emb: Tensor,
+        visual_emb: Optional[Tensor] = None,
+        alpha: float = 0.7,
+    ) -> Tensor:
         """计算 pose_emb 在 K 投影空间的语义键（用于 LongTermBank 语义相似度）。
 
         使用所有 memory 层的 K 投影平均，不同层捕捉不同抽象层次的场景特征，
         平均后对 novelty check 和检索更鲁棒（借鉴 HyDRA 思路，本工作独立设计）。
 
+        若提供 visual_emb，则融合视觉特征（Innovation 9: Visual Feature Fusion）：
+          semantic_key = alpha * normalize(pose_key) + (1-alpha) * normalize(vis_key)
+        此设计解决"相机方向相同但视觉不同的走廊"被 LongTermBank 误判为重复的问题。
+
         Args:
-            pose_emb: [dim=5120]，单帧的 camera pose embedding（来自 get_projected_frame_embs 的某一帧）
+            pose_emb:   [dim=5120]，单帧的 camera pose embedding（来自 get_projected_frame_embs 的某一帧）
+            visual_emb: [dim=5120]（可选）VAE latent 投影到模型空间的视觉嵌入
+                        （即 get_projected_latent_emb() 的输出）；
+                        若提供则融合（Innovation 9 Visual Feature Fusion）；
+                        None 时退化为纯 pose_key（与 v3 行为完全一致）
+            alpha:      pose_key 权重（默认 0.7），1-alpha 为 visual_key 权重
 
         Returns:
-            semantic_key: [dim=5120]，所有 memory 层 K 投影的平均，已 detach
+            semantic_key: [dim=5120]，已 detach
         """
         keys = []
         for idx in self._memory_layers:
             ca = self.blocks[idx].memory_cross_attn
             # ca.k: Linear(dim → dim)，ca.norm_k: RMSNorm
             keys.append(ca.norm_k(ca.k(pose_emb)))
-        return torch.stack(keys).mean(dim=0).detach()  # [dim=5120]
+        pose_key = torch.stack(keys).mean(dim=0)  # [dim=5120]
+
+        if visual_emb is not None:
+            # Innovation 9: Visual Feature Fusion — 融合视觉特征
+            vis_key = torch_F.normalize(self.visual_key_proj(visual_emb), dim=-1)
+            key = alpha * torch_F.normalize(pose_key, dim=-1) + (1.0 - alpha) * vis_key
+            return key.detach()
+        return pose_key.detach()  # [dim=5120]
 
     # ------------------------------------------------------------------
     # 推理辅助：提取 per-frame pose embedding（用于 MemoryBank 存储与检索）
@@ -397,7 +427,7 @@ class WanModelWithMemory(WanModel):
         if missing:
             logger.info(
                 "from_wan_model: %d keys not in base model "
-                "(expected: memory_cross_attn + nfp_head + latent_proj): %s",
+                "(expected: memory_cross_attn + nfp_head + latent_proj + visual_key_proj + tier_emb): %s",
                 len(missing), missing[:5],
             )
 
