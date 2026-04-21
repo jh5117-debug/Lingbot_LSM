@@ -6,9 +6,9 @@ train_v4_stage1_dual.py — LingBot-World Memory Enhancement 训练脚本 v4
 在 v3 基础上新增 5 项 Innovation：
 
   Innovation 6 — 随机 N-clip 串联训练（Stochastic N-clip Training）
-    • 移除 --num_context_clips，改为 --max_context_clips（default=4）
-    • 每 step 随机采样 n_ctx ~ Uniform(1, max_context_clips)
-    • 数据集窗口大小 = max_context_clips + 1（最多 5 clips）
+    • 移除 --num_context_clips，改为 --max_context_clips（default=6）
+    • 每 step 随机采样 n_ctx ~ Uniform(2, max_context_clips)
+    • 数据集窗口大小 = max_context_clips + 1（最多 7 clips）
     • target clip = batch_clips[n_ctx]，其余 clips 本 step 不使用
 
   Innovation 7 — Context Drop-off（retrieve 前随机丢弃部分 bank entries）
@@ -190,7 +190,7 @@ class CSGOMultiClipDataset(Dataset):
     v4 变更（Innovation 6）：
       - 参数从 num_context_clips 改为 max_context_clips
       - window_size = max_context_clips + 1（返回最多 max_context_clips+1 个连续 clips）
-      - 训练循环内通过随机采样 n_ctx ~ Uniform(1, max_context_clips) 决定实际使用多少个 context
+      - 训练循环内通过随机采样 n_ctx ~ Uniform(2, max_context_clips) 决定实际使用多少个 context
 
     每个 clip 数据（视频帧使用 cv2 + pad/truncate，与 CSGODataset 对齐）：
         {
@@ -207,7 +207,7 @@ class CSGOMultiClipDataset(Dataset):
         self,
         dataset_dir: str,
         split: str = "train",
-        max_context_clips: int = 4,  # Innovation 6: 改为 max_context_clips
+        max_context_clips: int = 6,  # Innovation 6: 改为 max_context_clips
         num_frames: int = 81,
         height: int = 480,
         width: int = 832,
@@ -1004,7 +1004,7 @@ def multi_clip_training_step(
         total_loss:  Tensor scalar，用于 accelerator.backward(loss)
 
     Innovation 6 — 随机 N-clip：
-        n_ctx = random.randint(1, args.max_context_clips)  每 step 随机采样
+        n_ctx = random.randint(2, args.max_context_clips)  每 step 随机采样
         context clips = batch_clips[:n_ctx]（前 n_ctx 个）
         target clip   = batch_clips[n_ctx]（第 n_ctx+1 个）
         余下 clips 本 step 不使用
@@ -1030,9 +1030,9 @@ def multi_clip_training_step(
     device = trainer.device
 
     # ----------------------------------------------------------------
-    # Innovation 6：随机采样 n_ctx ~ Uniform(1, max_context_clips)
+    # Innovation 6：随机采样 n_ctx ~ Uniform(2, max_context_clips)
     # ----------------------------------------------------------------
-    n_ctx = random.randint(1, args.max_context_clips)
+    n_ctx = random.randint(2, args.max_context_clips)
     context_clips = batch_clips[:n_ctx]
     target_clip = batch_clips[n_ctx]
     # batch_clips[n_ctx+1:] 本 step 不使用
@@ -1467,7 +1467,7 @@ def parse_args() -> argparse.Namespace:
 
     v4 变更（相对 v3）：
       - 移除 --num_context_clips
-      - 新增 --max_context_clips（type=int, default=4，Innovation 6）
+      - 新增 --max_context_clips（type=int, default=6，Innovation 6）
       - 新增 --context_drop_p_max（type=float, default=0.3，Innovation 7）
       - 新增 --visual_fusion_alpha（type=float, default=0.7，Innovation 9）
       - --long_cap 的 default 改为 32（v4 新默认值，比 v3 的 16 更大）
@@ -1535,8 +1535,8 @@ def parse_args() -> argparse.Namespace:
 
     # ---- v4 新增：随机 N-clip 训练参数（Innovation 6）----
     # 注：v3 的 --num_context_clips 已移除，替换为 --max_context_clips
-    parser.add_argument("--max_context_clips", type=int, default=4,
-                        help="最大 context clip 数量（N ~ Uniform(1, max_context_clips)），"
+    parser.add_argument("--max_context_clips", type=int, default=6,
+                        help="最大 context clip 数量（N ~ Uniform(2, max_context_clips)），"
                              "数据集 window_size = max_context_clips+1（Innovation 6）")
 
     # ---- v4 新增：Context Drop-off 参数（Innovation 7）----
@@ -1550,8 +1550,8 @@ def parse_args() -> argparse.Namespace:
                              "（Innovation 9）")
 
     # ---- ThreeTierMemoryBank 超参数（v4 更新：--long_cap default=32）----
-    parser.add_argument("--short_cap", type=int, default=2,
-                        help="ShortTermBank 容量（FIFO，默认 2）")
+    parser.add_argument("--short_cap", type=int, default=1,
+                        help="ShortTermBank 容量（FIFO，默认 1）")
     parser.add_argument("--medium_cap", type=int, default=8,
                         help="MediumTermBank 容量（高 surprise 帧，默认 8）")
     parser.add_argument("--long_cap", type=int, default=32,

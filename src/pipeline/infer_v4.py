@@ -267,8 +267,8 @@ def _parse_args():
                         help="生成的 clip 数量（默认 12，目标为 12 clip 连续生成）")
 
     # ---- ThreeTierMemoryBank 超参数（全量暴露，无向后兼容 alias）----
-    parser.add_argument("--short_cap", type=int, default=2,
-                        help="ShortTermBank 容量（默认 2）")
+    parser.add_argument("--short_cap", type=int, default=1,
+                        help="ShortTermBank 容量（默认 1）")
     parser.add_argument("--medium_cap", type=int, default=8,
                         help="MediumTermBank 容量（默认 8）")
     parser.add_argument("--long_cap", type=int, default=32,  # v4 默认值对齐训练脚本（train_v4: default=32）

@@ -2,7 +2,8 @@
 infer_v3.py — LingBot-World Memory Enhancement 推理脚本（ThreeTierMemoryBank 版本）
 
 与 infer_v2.py 的关系：
-  - ThreeTierMemoryBank 默认启用（移除 --use_memory / --use_three_tier 开关）
+  - 新增 --use_memory 开关（store_true，默认关闭）；传入才启用 ThreeTierMemoryBank 和 WanModelWithMemory
+  - 不传 --use_memory 时为纯 baseline 模式（基础模型直接推理，无 memory 转换）
   - 移除 MemoryBank 相关路径和 --memory_max_size 参数
   - 所有 ThreeTierMemoryBank 超参数直接暴露为 CLI 参数
   - bank.update() 新增 semantic_key（model.get_semantic_key(pose_emb)）
@@ -216,7 +217,7 @@ def _configure_memory_model_for_dist(model, use_sp: bool, device):
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="CSGO 推理脚本（ThreeTierMemoryBank 版本，v3）"
+        description="CSGO 推理脚本（v3，支持 ThreeTierMemoryBank，默认关闭，--use_memory 启用）"
     )
 
     # ---- 原有参数（与 infer_v2.py 完全一致）----
@@ -256,6 +257,9 @@ def _parse_args():
     # ---- v3 新参数：num_clips 默认改为 12 ----
     parser.add_argument("--num_clips", type=int, default=12,
                         help="生成的 clip 数量（默认 12，目标为 12 clip 连续生成）")
+
+    parser.add_argument("--use_memory", action="store_true", default=False,
+                        help="启用 ThreeTierMemoryBank 和 WanModelWithMemory（默认关闭，传入此标志才启用）")
 
     # ---- ThreeTierMemoryBank 超参数（全量暴露，无向后兼容 alias）----
     parser.add_argument("--short_cap", type=int, default=2,
@@ -808,12 +812,11 @@ def main():
     # ---- Step 3：加载 WanI2V 管道 ----
     cfg = WAN_CONFIGS["i2v-A14B"]
 
-    # SP 模式下，延迟到 _convert_pipeline_to_memory 之后手动应用（v3 始终使用 memory）
+    # SP 模式下，memory 模式时延迟到 _convert_pipeline_to_memory 之后手动应用
     _use_sp   = args.ulysses_size > 1
     _use_fsdp = args.dit_fsdp
-    if _use_sp:
-        # 避免 WanI2V._configure_model 对原始 WanModel 的 block 打 SP 补丁；
-        # MemoryBlockWrapper 转换后再手动应用（见 Step 4）
+    if _use_sp and args.use_memory:
+        # memory 模式下：WanI2V 不做 SP，等 _convert_pipeline_to_memory 后手动应用
         _wan_use_sp   = False
         _wan_dit_fsdp = False
     else:
@@ -832,44 +835,60 @@ def main():
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    # ---- Step 4：ThreeTierMemoryBank 初始化（v3 始终启用，无开关）----
-    from memory_module.memory_bank import ThreeTierMemoryBank
+    # ---- Step 4：ThreeTierMemoryBank 初始化（仅当 --use_memory 时启用）----
+    bank = None
 
-    logger.info(
-        "ThreeTierMemoryBank enabled. Converting pipeline to WanModelWithMemory..."
-    )
-    _memory_ckpt_path = os.path.join(args.ckpt_dir, "memory_weights.pth")
-    wan_i2v = _convert_pipeline_to_memory(
-        wan_i2v,
-        memory_ckpt_path=_memory_ckpt_path,     # V5-B2-01 fix: LoRA 模式下加载训练好的 memory 权重
-        high_model_dir=args.ft_high_model_dir,   # dual 模型支持
-        low_model_dir=args.ft_model_dir,         # 修复 .block. key 不匹配导致的全量权重丢失
-    )
+    if args.use_memory:
+        from memory_module.memory_bank import ThreeTierMemoryBank
 
-    # 在转换为 WanModelWithMemory 之后，手动应用 Ulysses SP
-    if _use_sp:
-        from memory_module.model_with_memory import WanModelWithMemory as _WMM
-        logger.info("Applying Ulysses SP to WanModelWithMemory (use_sp=True, world_size=%d)", world_size)
-        if isinstance(wan_i2v.low_noise_model, _WMM):
-            wan_i2v.low_noise_model = _configure_memory_model_for_dist(
-                wan_i2v.low_noise_model, use_sp=True, device=device)
-        if isinstance(wan_i2v.high_noise_model, _WMM):
-            wan_i2v.high_noise_model = _configure_memory_model_for_dist(
-                wan_i2v.high_noise_model, use_sp=True, device=device)
-
-    # T5-FSDP + SP 模式：SP init 会把 DiT 搬到 GPU，但 generate() 第一步就做 T5 FSDP
-    # 文本编码，此时 DiT 和 T5 同时在 GPU 会 OOM（CUBLAS_STATUS_ALLOC_FAILED）。
-    if args.t5_fsdp and _use_sp:
         logger.info(
-            "T5-FSDP+SP mode: offloading DiT to CPU before text encoding to avoid OOM"
+            "ThreeTierMemoryBank enabled. Converting pipeline to WanModelWithMemory..."
         )
-        for _attr in ('low_noise_model', 'high_noise_model'):
-            _m = getattr(wan_i2v, _attr, None)
-            if _m is not None and next(_m.parameters()).device.type == 'cuda':
-                _m.to('cpu')
-        torch.cuda.empty_cache()
+        _memory_ckpt_path = os.path.join(args.ckpt_dir, "memory_weights.pth")
+        wan_i2v = _convert_pipeline_to_memory(
+            wan_i2v,
+            memory_ckpt_path=_memory_ckpt_path,
+            high_model_dir=args.ft_high_model_dir,
+            low_model_dir=args.ft_model_dir,
+        )
 
-    # M-2 fix: 多卡时必须启用 Ulysses，否则各 rank 生成结果不一致
+        # 在转换为 WanModelWithMemory 之后，手动应用 Ulysses SP
+        if _use_sp:
+            from memory_module.model_with_memory import WanModelWithMemory as _WMM
+            logger.info("Applying Ulysses SP to WanModelWithMemory (use_sp=True, world_size=%d)", world_size)
+            if isinstance(wan_i2v.low_noise_model, _WMM):
+                wan_i2v.low_noise_model = _configure_memory_model_for_dist(
+                    wan_i2v.low_noise_model, use_sp=True, device=device)
+            if isinstance(wan_i2v.high_noise_model, _WMM):
+                wan_i2v.high_noise_model = _configure_memory_model_for_dist(
+                    wan_i2v.high_noise_model, use_sp=True, device=device)
+
+        # T5-FSDP + SP 模式：offload DiT 到 CPU 避免 OOM
+        if args.t5_fsdp and _use_sp:
+            logger.info(
+                "T5-FSDP+SP mode: offloading DiT to CPU before text encoding to avoid OOM"
+            )
+            for _attr in ('low_noise_model', 'high_noise_model'):
+                _m = getattr(wan_i2v, _attr, None)
+                if _m is not None and next(_m.parameters()).device.type == 'cuda':
+                    _m.to('cpu')
+            torch.cuda.empty_cache()
+
+        bank = ThreeTierMemoryBank(
+            short_cap=args.short_cap,
+            medium_cap=args.medium_cap,
+            long_cap=args.long_cap,
+            surprise_threshold=args.surprise_threshold,
+            stability_threshold=args.stability_threshold,
+            novelty_threshold=args.novelty_threshold,
+            half_life=args.half_life,
+            dup_threshold=args.dup_threshold,
+        )
+        logger.info("ThreeTierMemoryBank created: %s", bank)
+    else:
+        logger.info("Memory module disabled (--use_memory not set). Running in baseline mode.")
+
+    # M-2 check（多卡推理 Ulysses 要求，memory 开关不影响此检查）
     if world_size > 1 and args.ulysses_size != world_size:
         raise ValueError(
             f"world_size={world_size} but ulysses_size={args.ulysses_size}. "
@@ -877,7 +896,7 @@ def main():
             "Use --ulysses_size to set it, or run single-GPU."
         )
 
-    # Ulysses SP 要求 num_heads 能被 ulysses_size 整除
+    # Ulysses SP num_heads 整除检查
     if args.ulysses_size > 1:
         _num_heads = cfg.num_heads
         if _num_heads % args.ulysses_size != 0:
@@ -887,19 +906,6 @@ def main():
                 f"({args.ulysses_size}) == 0. "
                 f"Valid GPU counts: {_valid}"
             )
-
-    # 创建 ThreeTierMemoryBank（使用 CLI 参数，全量超参数暴露）
-    bank = ThreeTierMemoryBank(
-        short_cap=args.short_cap,
-        medium_cap=args.medium_cap,
-        long_cap=args.long_cap,
-        surprise_threshold=args.surprise_threshold,
-        stability_threshold=args.stability_threshold,
-        novelty_threshold=args.novelty_threshold,
-        half_life=args.half_life,
-        dup_threshold=args.dup_threshold,
-    )
-    logger.info("ThreeTierMemoryBank created: %s", bank)
 
     # ---- Step 5：加载图像，多 clip 连续生成 ----
     img = Image.open(args.image).convert("RGB")
@@ -944,12 +950,12 @@ def main():
         logger.info("Generating clip %d/%d ...", clip_idx + 1, args.num_clips)
 
         # 新 clip 开始前，已存储帧 age +1（MediumTermBank age decay）
-        if clip_idx > 0:
+        if clip_idx > 0 and bank is not None:
             bank.increment_age()
 
-        # B4-1 修复：按 clip 计算当前帧段的 c2ws_plucker_emb（多 clip 时每 clip 用正确的 pose）
+        # B4-1 修复：按 clip 计算当前帧段的 c2ws_plucker_emb（仅 memory 模式需要）
         _c2ws_plucker_emb_for_bank = None
-        if _poses_np is not None:
+        if args.use_memory and _poses_np is not None:
             try:
                 clip_start_frame_idx = clip_idx * args.frame_num
                 clip_end_frame_idx = clip_start_frame_idx + args.frame_num
@@ -983,78 +989,80 @@ def main():
                     clip_idx + 1, _e,
                 )
 
-        # M-4：如果有广播来的 memory_states，优先使用（多卡一致性）
+        # memory 状态初始化（baseline 模式下始终为 None）
         memory_value_states_clip = None
-        if _broadcast_memory_states is not None:
-            memory_states, memory_value_states_clip = _broadcast_memory_states
-            _broadcast_memory_states = None  # 消费后清空
-            logger.info("Clip %d: using broadcast memory_states (M-4 fix)", clip_idx + 1)
-        else:
-            # 检索 memory（首 clip 时 bank 为空，memory_states=None）
-            memory_states = None
-            memory_value_states_clip = None
-            if bank.size() > 0:
-                # HIGH-1 修复：用 get_projected_frame_embs 计算真实 pose query
-                model_lnm = wan_i2v.low_noise_model
-                if isinstance(model_lnm, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
-                    with torch.no_grad():
-                        _qfe = model_lnm.get_projected_frame_embs(
-                            _c2ws_plucker_emb_for_bank.to(device)
-                        )  # [lat_f, dim=5120]
-                    query_emb = _qfe[0].to(device)  # [5120]，当前 clip 第一帧 pose emb
-                    # v3 新增：计算 query_semantic_key（用于 LongTermBank 检索）
-                    with torch.no_grad():
-                        query_semantic_key = model_lnm.get_semantic_key(query_emb)  # [5120]
-                else:
-                    # 退化：无 pose 数据时使用 zero query
-                    query_emb = torch.zeros(5120, device=device)
-                    query_semantic_key = None
-                    logger.warning("Clip %d: falling back to zero query (no pose data)", clip_idx + 1)
+        memory_states = None
 
-                # v3：使用 ThreeTierMemoryBank.retrieve() 接口
-                retrieved = bank.retrieve(
-                    query_pose_emb=query_emb,
-                    query_semantic_key=query_semantic_key,  # v3 新增
-                    short_n=args.short_cap,
-                    medium_k=args.hybrid_medium_k,
-                    long_k=args.hybrid_long_k,
-                    device=device,
-                )
-                if retrieved is not None:
-                    key_states, value_states = retrieved   # 各 [k, 5120]，k ≤ 7
-                    assert key_states.shape[0] <= 7, (
-                        f"Clip {clip_idx+1}: retrieve() returned {key_states.shape[0]} frames, max budget is 7"
+        if args.use_memory:
+            # M-4：如果有广播来的 memory_states，优先使用（多卡一致性）
+            if _broadcast_memory_states is not None:
+                memory_states, memory_value_states_clip = _broadcast_memory_states
+                _broadcast_memory_states = None  # 消费后清空
+                logger.info("Clip %d: using broadcast memory_states (M-4 fix)", clip_idx + 1)
+            else:
+                # 检索 memory（首 clip 时 bank 为空，memory_states=None）
+                if bank is not None and bank.size() > 0:
+                    # HIGH-1 修复：用 get_projected_frame_embs 计算真实 pose query
+                    model_lnm = wan_i2v.low_noise_model
+                    if isinstance(model_lnm, WanModelWithMemory) and _c2ws_plucker_emb_for_bank is not None:
+                        with torch.no_grad():
+                            _qfe = model_lnm.get_projected_frame_embs(
+                                _c2ws_plucker_emb_for_bank.to(device)
+                            )  # [lat_f, dim=5120]
+                        query_emb = _qfe[0].to(device)  # [5120]，当前 clip 第一帧 pose emb
+                        # v3 新增：计算 query_semantic_key（用于 LongTermBank 检索）
+                        with torch.no_grad():
+                            query_semantic_key = model_lnm.get_semantic_key(query_emb)  # [5120]
+                    else:
+                        # 退化：无 pose 数据时使用 zero query
+                        query_emb = torch.zeros(5120, device=device)
+                        query_semantic_key = None
+                        logger.warning("Clip %d: falling back to zero query (no pose data)", clip_idx + 1)
+
+                    # v3：使用 ThreeTierMemoryBank.retrieve() 接口
+                    retrieved = bank.retrieve(
+                        query_pose_emb=query_emb,
+                        query_semantic_key=query_semantic_key,  # v3 新增
+                        short_n=args.short_cap,
+                        medium_k=args.hybrid_medium_k,
+                        long_k=args.hybrid_long_k,
+                        device=device,
                     )
-                    memory_states = key_states.unsqueeze(0)               # [1, K, dim]
-                    memory_value_states_clip = value_states.unsqueeze(0)  # [1, K, dim]
-                    logger.info("Clip %d: retrieved %d memory frames.", clip_idx + 1, key_states.shape[0])
-            # C-1 fix: 多卡场景下广播 rank=0 检索结果给所有 rank
-            # 这处理 M-4 广播为 None（模型非 WanModelWithMemory 或无 pose 数据）时的退化路径
-            if world_size > 1 and dist.is_initialized():
-                # broadcast_object_list 要求 CPU tensor，广播前移至 CPU，接收后移回 device
-                _c1_obj = (
-                    (memory_states.cpu(), memory_value_states_clip.cpu())
-                    if memory_states is not None else None
-                )
-                _c1_payload = [_c1_obj]
-                dist.broadcast_object_list(_c1_payload, src=0)
-                if _c1_payload[0] is not None:
-                    _c1_ms, _c1_mv = _c1_payload[0]
-                    memory_states = _c1_ms.to(device)
-                    memory_value_states_clip = _c1_mv.to(device)
-                else:
-                    memory_states = None
-                    memory_value_states_clip = None
+                    if retrieved is not None:
+                        key_states, value_states = retrieved   # 各 [k, 5120]，k ≤ 7
+                        assert key_states.shape[0] <= 7, (
+                            f"Clip {clip_idx+1}: retrieve() returned {key_states.shape[0]} frames, max budget is 7"
+                        )
+                        memory_states = key_states.unsqueeze(0)               # [1, K, dim]
+                        memory_value_states_clip = value_states.unsqueeze(0)  # [1, K, dim]
+                        logger.info("Clip %d: retrieved %d memory frames.", clip_idx + 1, key_states.shape[0])
+                # C-1 fix: 多卡场景下广播 rank=0 检索结果给所有 rank
+                if world_size > 1 and dist.is_initialized():
+                    # broadcast_object_list 要求 CPU tensor，广播前移至 CPU，接收后移回 device
+                    _c1_obj = (
+                        (memory_states.cpu(), memory_value_states_clip.cpu())
+                        if memory_states is not None else None
+                    )
+                    _c1_payload = [_c1_obj]
+                    dist.broadcast_object_list(_c1_payload, src=0)
+                    if _c1_payload[0] is not None:
+                        _c1_ms, _c1_mv = _c1_payload[0]
+                        memory_states = _c1_ms.to(device)
+                        memory_value_states_clip = _c1_mv.to(device)
+                    else:
+                        memory_states = None
+                        memory_value_states_clip = None
 
-        # M-1 修复：注册 forward hook 捕获 model.blocks[-1] hidden_states（供 NFPHead 使用）
+        # M-1 修复：注册 forward hook 捕获 model.blocks[-1] hidden_states（仅 memory 模式）
         _nfp_captured_hs = {}
         _nfp_hook_handle = None
-        _model_lnm = wan_i2v.low_noise_model
-        if isinstance(_model_lnm, WanModelWithMemory):
-            def _nfp_capture_hook(module, inp, out):
-                hs = out[0] if isinstance(out, (tuple, list)) else out
-                _nfp_captured_hs['hs'] = hs.detach().cpu()
-            _nfp_hook_handle = _model_lnm.blocks[-1].register_forward_hook(_nfp_capture_hook)
+        if args.use_memory:
+            _model_lnm = wan_i2v.low_noise_model
+            if isinstance(_model_lnm, WanModelWithMemory):
+                def _nfp_capture_hook(module, inp, out):
+                    hs = out[0] if isinstance(out, (tuple, list)) else out
+                    _nfp_captured_hs['hs'] = hs.detach().cpu()
+                _nfp_hook_handle = _model_lnm.blocks[-1].register_forward_hook(_nfp_capture_hook)
 
         # MODIFIED: multi-clip action offset bugfix — 为每个 clip 按 clip_idx 切片
         _clip_action_start = clip_idx * args.frame_num
@@ -1121,17 +1129,20 @@ def main():
             # HIGH-3 修复：确保存入 all_videos 的是 torch.Tensor
             _video_tensor = torch.from_numpy(video.copy()) if isinstance(video, np.ndarray) else video
             all_videos.append(_video_tensor)
-            # 更新 ThreeTierMemoryBank（v3 新增 semantic_key 计算）
-            _update_memory_bank_v3(
-                bank=bank,
-                video=video,
-                pipeline=wan_i2v,
-                device=device,
-                clip_start_frame=clip_idx * args.frame_num,
-                c2ws_plucker_emb=_c2ws_plucker_emb_for_bank,
-                last_hidden_states=_last_hs_for_nfp,
-                chunk_id=clip_idx,
-            )
+            if bank is not None:
+                # 更新 ThreeTierMemoryBank（v3 新增 semantic_key 计算）
+                _update_memory_bank_v3(
+                    bank=bank,
+                    video=video,
+                    pipeline=wan_i2v,
+                    device=device,
+                    clip_start_frame=clip_idx * args.frame_num,
+                    c2ws_plucker_emb=_c2ws_plucker_emb_for_bank,
+                    last_hidden_states=_last_hs_for_nfp,
+                    chunk_id=clip_idx,
+                )
+                logger.info("Clip %d: bank updated. Total size=%d", clip_idx + 1, bank.size())
+                logger.info("Clip %d: bank stats: %s", clip_idx + 1, bank.get_stats())
             # 使用最后一帧作为下一 clip 的初始帧
             last_frame_chw = video[:, -1]  # [C=3, H, W]
             if hasattr(last_frame_chw, 'cpu'):
@@ -1140,12 +1151,10 @@ def main():
             last_frame_hwc = last_frame_chw.transpose(1, 2, 0)
             last_frame_np = (last_frame_hwc * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
             current_img = Image.fromarray(last_frame_np)
-            logger.info("Clip %d: bank updated. Total size=%d", clip_idx + 1, bank.size())
-            logger.info("Clip %d: bank stats: %s", clip_idx + 1, bank.get_stats())
 
-        # M-4 修复：广播 memory_states 给所有 rank（仅多卡 Ulysses 模式需要）
-        if world_size > 1 and dist.is_initialized():
-            if rank == 0 and bank.size() > 0:
+        # M-4 修复：广播 memory_states 给所有 rank（仅 memory 模式 + 多卡时需要）
+        if args.use_memory and world_size > 1 and dist.is_initialized():
+            if rank == 0 and bank is not None and bank.size() > 0:
                 _m4_model = wan_i2v.low_noise_model
                 # N-03 修复：用下一 clip（clip_idx+1）的 pose 计算 M-4 广播的 memory query
                 _next_clip_idx = clip_idx + 1

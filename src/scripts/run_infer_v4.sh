@@ -34,7 +34,7 @@ GUIDE_SCALE=5.0
 SIZE="480*832"
 
 # ---- ThreeTierMemoryBank 超参数（保持 v4 默认值；通常无需修改）----
-SHORT_CAP=2              # ShortTermBank 容量（FIFO，保证 chunk 间衔接）
+SHORT_CAP=1              # ShortTermBank 容量（FIFO，保证 chunk 间衔接）
 MEDIUM_CAP=8             # MediumTermBank 容量（高 surprise 帧 + age decay 淘汰）
 LONG_CAP=32              # LongTermBank 容量（v4 扩容，v3 为 16）
 SURPRISE_THRESHOLD=0.4   # Medium 写入下限
