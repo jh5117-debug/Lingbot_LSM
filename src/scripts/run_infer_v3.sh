@@ -13,8 +13,8 @@ set -euo pipefail
 #   - 新增全量 ThreeTierMemoryBank 超参数（10 个）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010"
+IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
@@ -27,7 +27,7 @@ FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v3_stage1_dual/high_noi
 
 # 推理参数
 FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
-NUM_CLIPS=12             # v3 默认 12 clip 连续推理（v2 为 2）
+NUM_CLIPS=5             # v3 默认 12 clip 连续推理（v2 为 2）
                          # 确保 ACTION_PATH 内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS
 # Memory 模块开关（false = baseline 纯基础模型推理；true = 启用 ThreeTierMemoryBank）
 USE_MEMORY=true
@@ -49,7 +49,7 @@ HYBRID_LONG_K=2          # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95       # cross-tier dedup 阈值
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"                        # 单卡推理默认 "0"；多卡内存模式（USE_MEMORY=true）改为如 "0,1,2,3"
+CUDA_VISIBLE_DEVICES="0,1,2,3"                        # 单卡推理默认 "0"；多卡内存模式（USE_MEMORY=true）改为如 "0,1,2,3"
 
 # ============================================================
 # 以下内容通常无需修改
