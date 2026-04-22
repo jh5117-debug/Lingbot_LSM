@@ -76,7 +76,8 @@ else
 fi
 
 # ---------- 推理结果根目录（与 run_infer_v3.sh 一致）----------
-OUTPUT_BASE="${PROJECT_ROOT}/outputs"
+MEMORY_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
+OUTPUT_BASE="${MEMORY_ROOT}/outputs"
 
 # ---------- OUTPUT_DIR 使用 RUN_NAME ----------
 OUTPUT_DIR="${OUTPUT_BASE}/eval_vbench/${RUN_NAME}"
