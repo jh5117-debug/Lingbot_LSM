@@ -13,8 +13,8 @@ set -euo pipefail
 #   - 新增全量 ThreeTierMemoryBank 超参数（10 个）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_26s_35s_fwd_back_two_windows/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_26s_35s_fwd_back_two_windows"
+IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
