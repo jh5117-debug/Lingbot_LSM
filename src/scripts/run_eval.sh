@@ -7,8 +7,11 @@ set -euo pipefail
 
 TEST_IMAGES_DIR="eval_data/images/"         # 测试图片目录（.jpg/.png）
 TEST_TRAJ_DIR="eval_data/trajectories/"     # 相机轨迹目录（与图片同名，后缀不限）
-OUTPUT_DIR="outputs/eval_vbench/"           # 生成视频和结果的根目录
 MODEL_CONFIG="eval_model_configs.yaml"      # 模型配置 YAML 路径
+
+# 评测运行名称（用于区分不同次评测，建议填入日期+简短描述）
+# 留空则自动用时间戳（格式 YYYYMMDD_HHMMSS）
+EVAL_RUN_NAME=""
 
 # 跳过开关（设为 true 可单独跑推理或单独跑评分）
 SKIP_INFERENCE=false   # true：跳过推理，直接对已有视频评分
@@ -38,6 +41,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 EVAL_SCRIPT="${PROJECT_ROOT}/src/pipeline/eval_vbench.py"
+
+# ---------- EVAL_RUN_NAME 默认为时间戳 ----------
+if [ -z "${EVAL_RUN_NAME}" ]; then
+    EVAL_RUN_NAME="$(date +%Y%m%d_%H%M%S)"
+fi
+
+# ---------- 推理结果根目录（与 run_infer_v3.sh 一致）----------
+OUTPUT_BASE="${PROJECT_ROOT}/outputs"
+
+# ---------- OUTPUT_DIR 追加 EVAL_RUN_NAME ----------
+OUTPUT_DIR="${OUTPUT_BASE}/eval_vbench/${EVAL_RUN_NAME}"
 
 # ---------- EVAL_SCRIPT 存在性检查 ----------
 if [ ! -f "${EVAL_SCRIPT}" ]; then
@@ -70,10 +84,7 @@ LOG_DIR="${PROJECT_ROOT}/logs/run_eval"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 
-# ---------- OUTPUT_DIR 路径解析 ----------
-if [[ "${OUTPUT_DIR}" != /* ]]; then
-    OUTPUT_DIR="${PROJECT_ROOT}/${OUTPUT_DIR}"
-fi
+# ---------- OUTPUT_DIR 创建 ----------
 mkdir -p "${OUTPUT_DIR}"
 
 # ---------- TEST_IMAGES_DIR 路径解析 ----------
@@ -89,6 +100,7 @@ fi
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement — VBench 评测"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "  EVAL_RUN_NAME   : ${EVAL_RUN_NAME}"
 echo "  TEST_IMAGES_DIR : ${TEST_IMAGES_DIR}"
 echo "  TEST_TRAJ_DIR   : ${TEST_TRAJ_DIR}"
 echo "  OUTPUT_DIR      : ${OUTPUT_DIR}"
