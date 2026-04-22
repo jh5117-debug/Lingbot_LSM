@@ -30,7 +30,7 @@ FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
 NUM_CLIPS=12             # v3 默认 12 clip 连续推理（v2 为 2）
                          # 确保 ACTION_PATH 内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS
 # Memory 模块开关（false = baseline 纯基础模型推理；true = 启用 ThreeTierMemoryBank）
-USE_MEMORY=false
+USE_MEMORY=true
 SAMPLE_STEPS=40
 SAMPLE_SHIFT=10.0
 GUIDE_SCALE=5.0
@@ -49,7 +49,7 @@ HYBRID_LONG_K=2          # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95       # cross-tier dedup 阈值
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0"                        # 单卡推理默认 "0"；多卡内存模式（USE_MEMORY=true）改为如 "0,1,2,3"
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"                        # 单卡推理默认 "0"；多卡内存模式（USE_MEMORY=true）改为如 "0,1,2,3"
 
 # ============================================================
 # 以下内容通常无需修改

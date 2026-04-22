@@ -56,6 +56,25 @@ CUDA_VISIBLE_DEVICES="0"                        # 推理单卡，通常无需修
 
 export CUDA_VISIBLE_DEVICES
 
+# ---------- GPU 计数 ----------
+NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
+
+# Wan14B 固定 40 个 attention heads；Ulysses SP 要求 num_heads % GPU数 == 0
+# v4 始终启用 Memory（无 --use_memory 开关），故多卡时始终需要整除检查（对比 run_infer_v3.sh 需额外判断 USE_MEMORY=true）
+if [ "${NUM_GPUS}" -gt 1 ]; then
+    if [ $((40 % NUM_GPUS)) -ne 0 ]; then
+        echo "[ERROR] Ulysses SP：${NUM_GPUS} 个 GPU 不能整除 Wan14B 的 40 个 attention heads（余数 $((40 % NUM_GPUS))）。" >&2
+        echo "[ERROR] 请将 CUDA_VISIBLE_DEVICES 的 GPU 数量改为 40 的因数，推荐：1 / 2 / 4 / 5 / 8 / 10" >&2
+        exit 1
+    fi
+fi
+
+# ---------- FT 权重提示 ----------
+if [ -z "${FT_MODEL_DIR}" ] && [ -z "${FT_HIGH_MODEL_DIR}" ] && [ -z "${LORA_PATH}" ]; then
+    echo "[INFO] 未设置 FT 权重（FT_MODEL_DIR/FT_HIGH_MODEL_DIR/LORA_PATH 均为空），将使用基础模型推理" >&2
+    echo "[INFO] 如需加载训练权重，请设置 FT_MODEL_DIR 或 FT_HIGH_MODEL_DIR" >&2
+fi
+
 # ---------- 路径检查 ----------
 _err=0
 if [ -z "${CKPT_DIR}" ];    then echo "[ERROR] CKPT_DIR 未设置"    >&2; _err=1; fi
@@ -103,6 +122,7 @@ mkdir -p "$(dirname "${SAVE_FILE}")"
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 推理 v4 启动"
 echo "  Innovations 9+10（visual fusion + tier embedding）"
+echo "  NUM_CLIPS: ${NUM_CLIPS} | NUM_GPUS: ${NUM_GPUS}"
 echo "  EXP_NAME   : ${EXP_NAME}"
 echo "  CLIP_NAME  : ${CLIP_NAME}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
@@ -155,8 +175,27 @@ if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
     CMD+=(--ft_high_model_dir "${FT_HIGH_MODEL_DIR}")
 fi
 
+# ---------- 启动方式：多卡用 torchrun，单卡用 python ----------
+if [ "${NUM_GPUS}" -gt 1 ]; then
+    CMD+=(--ulysses_size "${NUM_GPUS}")
+    CMD+=(--t5_fsdp)          # 多卡时对 T5 做 FSDP 分片，避免每卡复制全量 T5（~22 GiB）
+    # 动态选取空闲端口，避免 EADDRINUSE
+    MASTER_PORT=$(python -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+    # 替换脚本中第一个元素 python → torchrun
+    LAUNCH=(
+        torchrun
+        --nproc_per_node "${NUM_GPUS}"
+        --master_port "${MASTER_PORT}"
+    )
+    # CMD 第一个元素是 "python"，第二个是脚本路径
+    # 重新构造：去掉 python，用 torchrun + 脚本路径
+    FULL_CMD=("${LAUNCH[@]}" "${CMD[@]:1}")
+else
+    FULL_CMD=("${CMD[@]}")
+fi
+
 echo "执行命令："
-echo "${CMD[*]}"
+echo "${FULL_CMD[*]}"
 echo ""
 
-"${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"
+"${FULL_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"; exit "${PIPESTATUS[0]}"

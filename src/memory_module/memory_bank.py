@@ -9,9 +9,9 @@ memory_bank.py — Memory Bank 模块
 
   2. 三层 ThreeTierMemoryBank（新增，Orchestrator 2026-04-15 授权）
      ┌─────────────────────────────────────────────────────────────────────┐
-     │  ShortTermBank   │ FIFO，容量 2，强制存最近帧，保证 chunk 连续性          │
+     │  ShortTermBank   │ FIFO，容量 1，强制存最近帧，保证 chunk 连续性          │
      │  MediumTermBank  │ 容量 8，高 surprise 帧，age decay eviction           │
-     │  LongTermBank    │ 容量 16，stable（低 surprise）且 novel（语义新颖）帧  │
+     │  LongTermBank    │ 容量 32，stable（低 surprise）且 novel（语义新颖）帧  │
      └─────────────────────────────────────────────────────────────────────┘
 
      MemoryFrame 新增字段（Orchestrator 2026-04-15 授权）：
@@ -19,8 +19,8 @@ memory_bank.py — Memory Bank 模块
                             = mean(norm_k_i(k_i(pose_emb)) for all memory_layers)
        tier str：标记所属层（"short"/"medium"/"long"），便于调试
 
-     混合检索预算（Hybrid Retrieval Budget）：Short 2 + Medium top-3 + Long top-2 = 7 帧
-     retrieve() 返回：(key_states [≤7,5120], value_states [≤7,5120])，去重后可能少于 7 帧
+     混合检索预算（Hybrid Retrieval Budget）：Short 1 + Medium top-3 + Long top-2 = 6 帧
+     retrieve() 返回：(key_states [≤6,5120], value_states [≤6,5120])，去重后可能少于 6 帧
 
 依赖：PyTorch（无 lingbot-world 依赖，独立可测试）
 设计参考：
@@ -298,14 +298,14 @@ class ShortTermBank:
 
     设计意图：
       - 无论 surprise 高低，每帧都强制存入
-      - 容量 2（默认），始终保留最新的 2 帧
+      - 容量 1（默认），始终保留最新的 1 帧
       - 检索时全部返回，提供 chunk 间衔接的近期上下文
     """
 
-    def __init__(self, cap: int = 2):
+    def __init__(self, cap: int = 1):
         """
         Args:
-            cap: 容量（FIFO 队列长度），默认 2
+            cap: 容量（FIFO 队列长度），默认 1
         """
         self.cap = cap
         self.frames: List[MemoryFrame] = []
@@ -511,13 +511,13 @@ class LongTermBank:
 
     def __init__(
         self,
-        cap: int = 16,
+        cap: int = 32,
         stability_threshold: float = 0.2,
         novelty_threshold: float = 0.7,
     ):
         """
         Args:
-            cap:                  最大容量
+            cap:                  最大容量（默认 32）
             stability_threshold:  写入上限（帧 surprise < 此值认为 stable）
             novelty_threshold:    写入上限（新帧与已存储帧 max cosine_sim < 此值认为 novel）
         """
@@ -743,14 +743,14 @@ class ThreeTierMemoryBank:
       - LongTermBank：stable AND novel 时写入（稳定场景，支持重访）
 
     混合检索预算（Hybrid Retrieval Budget）：
-      Short 2 + Medium top-3 + Long top-2 = 最多 7 帧（去重后可能更少）
+      Short 1 + Medium top-3 + Long top-2 = 最多 6 帧（去重后可能更少）
 
     Cross-tier Dedup：
       合并后移除 pose_emb cosine_sim > dup_threshold 的冗余帧。
       Short 帧先选，自然享有最高优先级。
 
     用法（推理循环）：
-        bank = ThreeTierMemoryBank(short_cap=2, medium_cap=8, long_cap=16)
+        bank = ThreeTierMemoryBank(short_cap=1, medium_cap=8, long_cap=32)
         # 每 chunk 生成后：
         bank.update(pose_emb, latent, surprise, timestep,
                     visual_emb=visual_emb, chunk_id=clip_idx,
@@ -759,14 +759,14 @@ class ThreeTierMemoryBank:
         # 生成前检索：
         retrieved = bank.retrieve(query_pose_emb, query_semantic_key)
         if retrieved is not None:
-            key_states, value_states = retrieved  # 各 [≤7, 5120]
+            key_states, value_states = retrieved  # 各 [≤6, 5120]
     """
 
     def __init__(
         self,
-        short_cap: int = 2,
+        short_cap: int = 1,
         medium_cap: int = 8,
-        long_cap: int = 16,
+        long_cap: int = 32,
         surprise_threshold: float = 0.4,
         stability_threshold: float = 0.2,
         novelty_threshold: float = 0.7,
@@ -775,9 +775,9 @@ class ThreeTierMemoryBank:
     ):
         """
         Args:
-            short_cap:            ShortTermBank 容量（默认 2）
+            short_cap:            ShortTermBank 容量（默认 1）
             medium_cap:           MediumTermBank 容量（默认 8）
-            long_cap:             LongTermBank 容量（默认 16）
+            long_cap:             LongTermBank 容量（默认 32）
             surprise_threshold:   MediumTermBank 写入下限（默认 0.4）
             stability_threshold:  LongTermBank stable 写入上限（默认 0.2）
             novelty_threshold:    LongTermBank novelty 写入上限（默认 0.7）
@@ -844,7 +844,7 @@ class ThreeTierMemoryBank:
         self,
         query_pose_emb: Tensor,
         query_semantic_key: Optional[Tensor] = None,
-        short_n: int = 2,
+        short_n: int = 1,
         medium_k: int = 3,
         long_k: int = 2,
         device: Optional[torch.device] = None,
@@ -862,7 +862,7 @@ class ThreeTierMemoryBank:
                                 为 None 时：LongTermBank 退化为 pose_emb cosine_sim 检索；
                                 LongTermBank.update() 跳过 novelty check，仅做 stability 检查。
                                 bank.size()==0 时无需计算 query_semantic_key（不会调用 retrieve）。
-            short_n:            从 ShortTermBank 取的帧数上限（默认 2，即全部）
+            short_n:            从 ShortTermBank 取的帧数上限（默认 1，即全部）
             medium_k:           从 MediumTermBank 取的帧数（默认 3）
             long_k:             从 LongTermBank 取的帧数（默认 2）
             device:             输出 tensor 放置的设备（None 则跟随 query_pose_emb.device）

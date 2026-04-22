@@ -508,7 +508,7 @@ def _convert_pipeline_to_memory(pipeline, memory_ckpt_path=None,
     import gc
     from memory_module.model_with_memory import WanModelWithMemory
 
-    # 使用固定大值确保内部 memory slot 足够（ThreeTierMemoryBank 最多 7 帧）
+    # 使用固定大值确保内部 memory slot 足够（ThreeTierMemoryBank 最多 6 帧）
     _internal_max_size = 8
 
     logger.info("Converting low_noise_model to WanModelWithMemory (ThreeTierMemoryBank mode)...")
@@ -1121,8 +1121,8 @@ def main():
                 )
                 if retrieved is not None:
                     key_states, value_states, tier_ids_clip = retrieved   # 各 [k, 5120]，tier_ids [k] int64
-                    assert key_states.shape[0] <= 7, (
-                        f"Clip {clip_idx+1}: retrieve() returned {key_states.shape[0]} frames, max budget is 7"
+                    assert key_states.shape[0] <= 6, (
+                        f"Clip {clip_idx+1}: retrieve() returned {key_states.shape[0]} frames, max budget is 6"
                     )
                     memory_states = key_states.unsqueeze(0)               # [1, K, dim]
                     memory_value_states_clip = value_states.unsqueeze(0)  # [1, K, dim]
@@ -1311,8 +1311,8 @@ def main():
                         return_tier_ids=True,  # Innovation 10
                     )
                     if _m4_retrieved is not None:
-                        _m4_k, _m4_v, _m4_tier_ids = _m4_retrieved   # 各 [K, 5120]，K ≤ 7
-                        assert _m4_k.shape[0] <= 7, f"M-4 broadcast: key_states 帧数 {_m4_k.shape[0]} 超过预算 7"
+                        _m4_k, _m4_v, _m4_tier_ids = _m4_retrieved   # 各 [K, 5120]，K ≤ 6
+                        assert _m4_k.shape[0] <= 6, f"M-4 broadcast: key_states 帧数 {_m4_k.shape[0]} 超过预算 6"
                         _m4_states = (
                             _m4_k.unsqueeze(0).cpu(),      # [1, K, dim]，HIGH-1 fix: .cpu() 避免 pickle CUDA tensor
                             _m4_v.unsqueeze(0).cpu(),      # [1, K, dim]，HIGH-1 fix: .cpu() 避免 pickle CUDA tensor

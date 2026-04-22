@@ -1354,8 +1354,8 @@ def multi_clip_training_step(
     if retrieved is not None:
         # Innovation 10: 解包三元组 (key_states, value_states, tier_ids)
         key_states, value_states, tier_ids = retrieved
-        assert key_states.shape[0] <= 7, (
-            f"retrieve() returned {key_states.shape[0]} > 7 frames"
+        assert key_states.shape[0] <= 6, (
+            f"retrieve() returned {key_states.shape[0]} > 6 frames"
         )
         memory_states = key_states.unsqueeze(0)        # [1, K, 5120]
         memory_value_states = value_states.unsqueeze(0)  # [1, K, 5120]
