@@ -150,8 +150,8 @@ def _parse_args():
         help="模型配置 YAML 文件路径（默认 eval_model_configs.yaml）",
     )
     parser.add_argument(
-        "--models", type=str, nargs="+", default=["groupA", "groupB", "groupC"],
-        help="要评测的模型 key 列表（默认 groupA groupB groupC）",
+        "--models", type=str, nargs="+", default=["baseline", "groupB", "groupC"],
+        help="要评测的模型 key 列表（默认 baseline groupB groupC）",
     )
     parser.add_argument(
         "--skip_inference", action="store_true", default=False,
@@ -279,9 +279,10 @@ def _normalize_clip_name(filename: str) -> str:
       "clip001_v3_20260421_153000.mp4" → "clip001"
       "clip001.mp4"                   → "clip001"
       "clip001"                       → "clip001"
+      "/path/to/clip001_v3_20260421_153000.mp4" → "clip001"
     """
+    name = Path(filename).name   # 取纯文件名，防止完整路径输入
     # 去掉 .mp4 后缀（大小写不敏感）
-    name = filename
     if name.lower().endswith(".mp4"):
         name = name[:-4]
     # 去掉时间戳后缀
@@ -846,8 +847,21 @@ def main():
         f"将评测的模型：{[model_configs[k].get('name', k) for k in available_models]}"
     )
 
-    # ---- Step 1：收集测试集 ----
-    test_pairs = _collect_test_images(args.test_images_dir, args.test_traj_dir)
+    # ---- Step 1：收集测试集（仅在需要 full pipeline 推理时加载）----
+    # 判断是否有任何模型需要 full pipeline 推理
+    need_inference = (
+        not args.skip_inference
+        and any(
+            not model_configs[k].get("video_dir", "")
+            for k in available_models
+        )
+    )
+
+    if need_inference:
+        test_pairs = _collect_test_images(args.test_images_dir, args.test_traj_dir)
+    else:
+        test_pairs = []
+        logger.info("所有模型均为 demo 模式或已设置 --skip_inference，跳过测试集加载。")
 
     # ---- Step 2：批量推理（每个模型独立决定 demo / full pipeline）----
     model_video_dirs: Dict[str, Optional[Path]] = {}
@@ -855,12 +869,28 @@ def main():
     if args.skip_inference:
         logger.info("--skip_inference 已设置，跳过所有模型推理阶段，使用已有视频。")
         for model_key in available_models:
-            video_dir = output_dir / model_key
-            if not video_dir.exists():
-                logger.warning(
-                    f"跳过推理，但模型 '{model_key}' 的视频目录不存在：{video_dir}"
-                )
-            model_video_dirs[model_key] = video_dir
+            model_cfg = model_configs[model_key]
+            video_dir_cfg = model_cfg.get("video_dir", "")
+            if video_dir_cfg:
+                # demo 模式：使用 YAML 指定路径（与 _run_inference_for_model demo 分支一致）
+                vd_path = Path(video_dir_cfg)
+                if not vd_path.is_absolute():
+                    vd_path = PROJECT_ROOT / vd_path
+                vd_path = vd_path.resolve()
+                if not vd_path.exists():
+                    logger.warning(
+                        f"[{model_cfg.get('name', model_key)}] --skip_inference: "
+                        f"video_dir 指定目录不存在：{vd_path}"
+                    )
+                model_video_dirs[model_key] = vd_path
+            else:
+                # full pipeline 输出目录
+                video_dir = output_dir / model_key
+                if not video_dir.exists():
+                    logger.warning(
+                        f"跳过推理，但模型 '{model_key}' 的视频目录不存在：{video_dir}"
+                    )
+                model_video_dirs[model_key] = video_dir
     else:
         logger.info("=" * 60)
         logger.info("开始批量推理阶段")

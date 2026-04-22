@@ -18,7 +18,7 @@ SKIP_INFERENCE=false   # true：跳过推理，直接对已有视频评分
 SKIP_VBENCH=false      # true：跳过 VBench，只做推理
 
 # 要评测的模型 key（空格分隔，需与 eval_model_configs.yaml 中的 key 一致）
-MODELS="groupA groupB groupC"
+MODELS="baseline groupB groupC"
 
 # VBench 评测维度（对应论文 Table 2 的 6 个维度）
 DIMENSIONS="imaging_quality aesthetic_quality dynamic_degree motion_smoothness temporal_flickering subject_consistency"
