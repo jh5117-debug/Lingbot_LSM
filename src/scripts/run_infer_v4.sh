@@ -107,6 +107,8 @@ else
     EXP_NAME="baseline"
 fi
 
+EXP_NAME="${EXP_NAME}_n${NUM_CLIPS}"
+
 # clip 名称取自 ACTION_PATH 目录名
 CLIP_NAME="$(basename "${ACTION_PATH}")"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
