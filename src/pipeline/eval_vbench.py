@@ -4,13 +4,18 @@ eval_vbench.py — 多模型 VBench 评测脚本
 功能：
   1. 批量推理：对测试集每张图片，调用各模型的推理脚本生成视频
      - 若 YAML 中 video_dir 非空，则跳过推理，直接使用已有视频（demo 模式）
+     - 若命令行传入 --video_dir，则直接使用该目录（无 YAML 单次 demo 模式）
   2. VBench 评分：对生成的视频调用 VBench（custom_input 模式）评分
   3. 汇总结果：
      - results_summary.csv（aggregate 分数，每模型一行）
      - results_per_clip.csv（per-clip 分数，每 clip×model 一行）
+     - _comparison/all_runs.csv（跨 run 注册表，累积追加）
+     - _comparison/comparison_per_clip.csv（跨 run per-clip 对比）
+     - _comparison/comparison_aggregate.csv（跨 run aggregate 对比）
 
-模型配置通过 eval_model_configs.yaml 传入。
+模型配置通过 eval_model_configs.yaml 传入（YAML 模式）。
 若配置文件不存在，自动生成模板并提示用户填写后重新运行。
+无 YAML 单次评测：直接传 --video_dir（demo 模式）或 --infer_script/--ft_model_dir 等参数。
 
 YAML 模板示例（复制到 eval_model_configs.yaml 并填写路径后使用）：
 ----------------------------------------------------------------------
@@ -49,7 +54,11 @@ import os
 import re
 import subprocess
 import sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Dict, Optional, Tuple
 
 import yaml
@@ -106,6 +115,7 @@ baseline:
   use_memory: false     # 是否启用 Memory Bank
   extra_args: []        # 额外命令行参数列表，示例: ["--sample_steps", "50"]
   launcher: "torchrun"  # 可选 python 或 torchrun（默认 torchrun）
+  sp_num_heads: 40   # Wan14B: 40 heads；用于计算最大合法 Ulysses SP GPU 数（heads%k==0）
 
 groupB:
   name: "Yume-1.5"
@@ -182,6 +192,40 @@ def _parse_args():
         "--prompt", type=str,
         default="First-person view of CS:GO competitive gameplay",
         help="生成 prompt（默认 First-person view of CS:GO competitive gameplay）",
+    )
+
+    # ---- 新增：无 YAML 单次评测参数 ----
+    parser.add_argument(
+        "--video_dir", type=str, default="",
+        help="demo 模式：已有视频文件夹绝对路径（非空则跳过推理，直接评分）",
+    )
+    parser.add_argument(
+        "--run_name", type=str, default="",
+        help="本次评测的标识名（demo 模式留空则取 basename(video_dir)）",
+    )
+    parser.add_argument(
+        "--infer_script", type=str, default="",
+        help="full pipeline 模式：推理脚本路径",
+    )
+    parser.add_argument(
+        "--ckpt_dir", type=str, default="",
+        help="full pipeline 模式：基础模型目录",
+    )
+    parser.add_argument(
+        "--ft_model_dir", type=str, default="",
+        help="full pipeline 模式：全参微调/dual-low 模型目录",
+    )
+    parser.add_argument(
+        "--ft_high_model_dir", type=str, default="",
+        help="full pipeline 模式：dual-high 模型目录",
+    )
+    parser.add_argument(
+        "--use_memory", action="store_true",
+        help="full pipeline 模式：启用 Memory Bank",
+    )
+    parser.add_argument(
+        "--lora_path", type=str, default="",
+        help="full pipeline 模式：LoRA 权重路径（可选）",
     )
 
     return parser.parse_args()
@@ -290,6 +334,25 @@ def _normalize_clip_name(filename: str) -> str:
     return name
 
 
+def _get_gpu_ids() -> list:
+    """从 CUDA_VISIBLE_DEVICES 解析可用 GPU ID 列表。"""
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cvd or cvd in ("NoDevFiles", "-1"):
+        return [0]
+    try:
+        return [int(x.strip()) for x in cvd.split(",") if x.strip()]
+    except ValueError:
+        return [0]
+
+
+def _find_max_sp_gpus(n: int, num_heads: int = 40) -> int:
+    """找最大合法 GPU 数 k ≤ n，满足 num_heads % k == 0（Ulysses SP 整除约束）。"""
+    for k in range(n, 0, -1):
+        if num_heads % k == 0:
+            return k
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # 单模型批量推理
 # ---------------------------------------------------------------------------
@@ -300,6 +363,7 @@ def _run_inference_for_model(
     test_pairs: list,
     output_dir: Path,
     args,
+    gpu_ids: list = None,
 ) -> Optional[Path]:
     """对单个模型跑所有测试样本的推理，返回该模型的视频输出目录。
 
@@ -339,6 +403,8 @@ def _run_inference_for_model(
     infer_script = model_cfg.get("infer_script", "")
     ckpt_dir = model_cfg.get("ckpt_dir", "")
     lora_path = model_cfg.get("lora_path", "")
+    ft_model_dir      = model_cfg.get("ft_model_dir", "")
+    ft_high_model_dir = model_cfg.get("ft_high_model_dir", "")
     use_memory = model_cfg.get("use_memory", False)
     extra_args = model_cfg.get("extra_args", [])
 
@@ -353,6 +419,10 @@ def _run_inference_for_model(
         f"[{model_name}] 开始推理，共 {total} 张图片，"
         f"输出目录：{model_video_dir}"
     )
+
+    # 解析可用 GPU 列表（full pipeline 模式）
+    if gpu_ids is None:
+        gpu_ids = _get_gpu_ids()
 
     for idx, (img_path, traj_path) in enumerate(test_pairs, start=1):
         output_video = model_video_dir / f"{img_path.stem}.mp4"
@@ -370,12 +440,22 @@ def _run_inference_for_model(
 
         # 拼接推理命令，根据 launcher 决定使用 torchrun 还是 python
         launcher = model_cfg.get("launcher", "torchrun")
+        env = os.environ.copy()
         if launcher == "torchrun":
+            sp_num_heads = model_cfg.get("sp_num_heads", 40)
+            k = _find_max_sp_gpus(len(gpu_ids), sp_num_heads)
+            infer_gpu_ids_str = ",".join(str(g) for g in gpu_ids[:k])
+            env["CUDA_VISIBLE_DEVICES"] = infer_gpu_ids_str
             cmd = [
-                "torchrun", "--nproc_per_node=1",
+                "torchrun", f"--nproc_per_node={k}",
                 str(infer_script),
             ]
+            logger.info(
+                f"[{model_name}] torchrun {k}/{len(gpu_ids)} GPU(s) (SP={sp_num_heads} heads)"
+            )
         else:
+            infer_gpu_ids_str = str(gpu_ids[0])
+            env["CUDA_VISIBLE_DEVICES"] = infer_gpu_ids_str
             cmd = [
                 "python",
                 str(infer_script),
@@ -394,6 +474,12 @@ def _run_inference_for_model(
         if lora_path:
             cmd += ["--lora_path", str(lora_path)]
 
+        # 全参微调 / dual 模型目录（组A专有）
+        if ft_model_dir:
+            cmd += ["--ft_model_dir", str(ft_model_dir)]
+        if ft_high_model_dir:
+            cmd += ["--ft_high_model_dir", str(ft_high_model_dir)]
+
         # Memory Bank（组A专有）
         if use_memory:
             cmd += ["--use_memory"]
@@ -408,7 +494,8 @@ def _run_inference_for_model(
             result = subprocess.run(
                 cmd,
                 check=True,
-                capture_output=False,  # 让输出直接打印到 stdout/stderr
+                capture_output=False,
+                env=env,
             )
         except subprocess.CalledProcessError as e:
             logger.warning(
@@ -444,6 +531,50 @@ def _check_vbench_installed():
         sys.exit(1)
 
 
+def _run_vbench_single_dim(
+    model_key: str,
+    model_name: str,
+    video_dir: Path,
+    dim: str,
+    vbench_mode: str,
+    output_dir: Path,
+    gpu_id: str,
+) -> tuple:
+    """对单个模型的单个 VBench 维度评分，在指定 GPU 上运行。
+    返回 (dim_score, dim_clip_scores)。
+    """
+    vbench_result_dir = output_dir / "vbench_results" / model_key
+    vbench_result_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+
+    cmd = [
+        "vbench", "evaluate",
+        "--videos_path", str(video_dir),
+        "--dimension", dim,
+        "--mode", vbench_mode,
+        "--output_path", str(vbench_result_dir),
+    ]
+
+    logger.info(
+        f"[{model_name}] VBench 维度：{dim}（GPU {gpu_id}），命令：{' '.join(cmd)}"
+    )
+
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        logger.warning(
+            f"[{model_name}] VBench 维度 '{dim}' 失败（returncode={e.returncode}），跳过。"
+        )
+        return None, {}
+
+    score = _parse_vbench_result(vbench_result_dir, dim)
+    clip_scores = _parse_vbench_per_clip(vbench_result_dir, dim)
+    logger.info(f"[{model_name}] {dim}: {score}（GPU {gpu_id}）")
+    return score, clip_scores
+
+
 def _run_vbench_for_model(
     model_key: str,
     model_name: str,
@@ -451,6 +582,7 @@ def _run_vbench_for_model(
     dimensions: list,
     vbench_mode: str,
     output_dir: Path,
+    gpu_id: str = "0",
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Dict[str, Optional[float]]]]:
     """对单个模型的视频目录跑所有维度的 VBench 评分。
 
@@ -461,45 +593,12 @@ def _run_vbench_for_model(
     scores: Dict[str, Optional[float]] = {}
     per_clip_scores: Dict[str, Dict[str, Optional[float]]] = {}
 
-    vbench_result_dir = output_dir / "vbench_results" / model_key
-    vbench_result_dir.mkdir(parents=True, exist_ok=True)
-
     for dim in dimensions:
-        logger.info(f"[{model_name}] VBench 评测维度：{dim}")
-
-        cmd = [
-            "vbench", "evaluate",
-            "--videos_path", str(video_dir),
-            "--dimension", dim,
-            "--mode", vbench_mode,
-            "--output_path", str(vbench_result_dir),
-        ]
-
-        logger.info(f"执行命令：{' '.join(cmd)}")
-
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            logger.warning(
-                f"[{model_name}] VBench 维度 '{dim}' 评测失败"
-                f"（returncode={e.returncode}），跳过。"
-            )
-            scores[dim] = None
-            per_clip_scores[dim] = {}
-            continue
-
-        # 解析 aggregate 分数
-        score = _parse_vbench_result(vbench_result_dir, dim)
+        score, clip_scores = _run_vbench_single_dim(
+            model_key, model_name, video_dir, dim, vbench_mode, output_dir, gpu_id
+        )
         scores[dim] = score
-        logger.info(f"[{model_name}] {dim}: {score}")
-
-        # 解析 per-clip 分数
-        clip_scores = _parse_vbench_per_clip(vbench_result_dir, dim)
         per_clip_scores[dim] = clip_scores
-        if clip_scores:
-            logger.info(
-                f"[{model_name}] {dim}: 解析到 {len(clip_scores)} 条 per-clip 分数"
-            )
 
     return scores, per_clip_scores
 
@@ -819,29 +918,157 @@ def _print_markdown_table(
 
 
 # ---------------------------------------------------------------------------
+# 跨 run 对比注册表
+# ---------------------------------------------------------------------------
+
+def _update_comparison_files(comparison_dir: Path, all_runs_csv: Path) -> None:
+    """从 all_runs.csv 重新生成 comparison_per_clip.csv 和 comparison_aggregate.csv。
+
+    纯标准库实现，不依赖 pandas。
+    """
+    if not all_runs_csv.exists():
+        return
+
+    with open(all_runs_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+
+    # 有序去重（保持首次出现顺序）
+    def _unique(seq):
+        seen: set = set()
+        return [x for x in seq if not (x in seen or seen.add(x))]  # type: ignore[func-returns-value]
+
+    run_names  = _unique(r["run_name"]  for r in rows)
+    clip_ids   = _unique(r["clip_id"]   for r in rows)
+    dimensions = _unique(r["dimension"] for r in rows)
+
+    # ---- comparison_per_clip.csv ----
+    per_clip_data: dict = {}
+    for row in rows:
+        key = (row["clip_id"], row["dimension"])
+        per_clip_data.setdefault(key, {})[row["run_name"]] = row["score"]
+
+    per_clip_path = comparison_dir / "comparison_per_clip.csv"
+    with open(per_clip_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["clip_id", "dimension"] + run_names)
+        writer.writeheader()
+        for clip_id in clip_ids:
+            for dim in dimensions:
+                key = (clip_id, dim)
+                if key not in per_clip_data:
+                    continue
+                row_out: dict = {"clip_id": clip_id, "dimension": dim}
+                for rn in run_names:
+                    row_out[rn] = per_clip_data[key].get(rn, "")
+                writer.writerow(row_out)
+    logger.info(f"已更新 {per_clip_path}")
+
+    # ---- comparison_aggregate.csv ----
+    agg: dict = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        s = row["score"]
+        if s and s.lower() not in ("", "none", "null"):
+            try:
+                agg[row["run_name"]][row["dimension"]].append(float(s))
+            except ValueError:
+                pass
+
+    agg_path = comparison_dir / "comparison_aggregate.csv"
+    with open(agg_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["model"] + dimensions + ["overall"])
+        writer.writeheader()
+        for rn in run_names:
+            row_out = {"model": rn}
+            dim_avgs = []
+            for dim in dimensions:
+                vals = agg[rn][dim]
+                if vals:
+                    avg = sum(vals) / len(vals)
+                    row_out[dim] = f"{avg:.4f}"
+                    dim_avgs.append(avg)
+                else:
+                    row_out[dim] = ""
+            row_out["overall"] = f"{sum(dim_avgs)/len(dim_avgs):.4f}" if dim_avgs else ""
+            writer.writerow(row_out)
+    logger.info(f"已更新 {agg_path}")
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
 def main():
     args = _parse_args()
 
-    # 加载模型配置（若不存在则自动生成模板并退出）
-    model_configs = _load_or_create_model_config(args.model_config)
+    # ---- run_name 推导 ----
+    run_name = args.run_name
+    if not run_name and args.video_dir:
+        run_name = Path(args.video_dir).name
+    if not run_name:
+        run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ---- 构造 synthetic model_configs（优先级：video_dir > infer_script > model_config YAML）----
+    if args.video_dir or args.infer_script or args.ft_model_dir:
+        # 单模型模式：用 run_name 作为 model_key，不读 YAML
+        model_configs = {
+            run_name: {
+                "name": run_name,
+                "video_dir": args.video_dir,
+                "infer_script": args.infer_script,
+                "ckpt_dir": args.ckpt_dir,
+                "ft_model_dir": args.ft_model_dir,
+                "ft_high_model_dir": args.ft_high_model_dir,
+                "use_memory": args.use_memory,
+                "lora_path": args.lora_path,
+                "launcher": "torchrun",
+                "sp_num_heads": 40,
+            }
+        }
+        model_keys = [run_name]
+    else:
+        # 原有 YAML 模式（向后兼容）
+        model_configs = _load_or_create_model_config(args.model_config)
+        model_keys = list(model_configs.keys())
+        if not run_name:
+            run_name = model_keys[0] if model_keys else datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 解析可用 GPU 列表
+    gpu_ids = _get_gpu_ids()
+    logger.info(f"检测到 GPU: {gpu_ids}（共 {len(gpu_ids)} 张）")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 过滤请求的模型
-    requested_models = args.models
-    available_models = [k for k in requested_models if k in model_configs]
-    missing_models = [k for k in requested_models if k not in model_configs]
-    if missing_models:
-        logger.warning(
-            f"以下模型在配置文件中不存在，已跳过：{missing_models}"
-        )
-    if not available_models:
-        logger.error("没有有效的模型可以评测，请检查 --models 和配置文件。")
-        sys.exit(1)
+    # ---- _comparison 目录 ----
+    comparison_dir = Path(args.output_dir).parent / "_comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    all_runs_csv = comparison_dir / "all_runs.csv"
+
+    # ---- skip-if-exists ----
+    if all_runs_csv.exists():
+        with open(all_runs_csv, newline="") as _f:
+            _existing = {row["run_name"] for row in csv.DictReader(_f)}
+        if run_name in _existing:
+            logger.info(
+                f"[{run_name}] 已在 _comparison/all_runs.csv 中存在，跳过本次评测。"
+            )
+            return
+
+    # 过滤请求的模型（无 YAML 单次模式：model_keys 已在上方构造）
+    if args.video_dir or args.infer_script or args.ft_model_dir:
+        available_models = model_keys
+    else:
+        requested_models = args.models
+        available_models = [k for k in requested_models if k in model_configs]
+        missing_models = [k for k in requested_models if k not in model_configs]
+        if missing_models:
+            logger.warning(
+                f"以下模型在配置文件中不存在，已跳过：{missing_models}"
+            )
+        if not available_models:
+            logger.error("没有有效的模型可以评测，请检查 --models 和配置文件。")
+            sys.exit(1)
 
     logger.info(
         f"将评测的模型：{[model_configs[k].get('name', k) for k in available_models]}"
@@ -903,6 +1130,7 @@ def main():
                 test_pairs=test_pairs,
                 output_dir=output_dir,
                 args=args,
+                gpu_ids=gpu_ids,
             )
             # video_dir 可能为 None（demo 模式但目录不存在）
             model_video_dirs[model_key] = video_dir
@@ -913,33 +1141,63 @@ def main():
 
     if not args.skip_vbench:
         logger.info("=" * 60)
-        logger.info("开始 VBench 评分阶段")
+        logger.info("开始 VBench 评分阶段（并发，共 {} GPU）".format(len(gpu_ids)))
         logger.info("=" * 60)
         _check_vbench_installed()
 
+        # 初始化 all_scores / all_per_clip 结构
+        for model_key in available_models:
+            all_scores[model_key] = {}
+            all_per_clip[model_key] = {}
+
+        # 构建任务列表：跳过视频目录不存在的模型
+        valid_tasks = []
         for model_key in available_models:
             model_name = model_configs[model_key].get("name", model_key)
             video_dir = model_video_dirs.get(model_key)
-
             if video_dir is None or not video_dir.exists():
                 logger.warning(
                     f"模型 '{model_name}' 的视频目录不存在或为 None，跳过 VBench 评分"
                     + (f"：{video_dir}" if video_dir else "")
                 )
-                all_scores[model_key] = {dim: None for dim in args.dimensions}
-                all_per_clip[model_key] = {dim: {} for dim in args.dimensions}
+                for dim in args.dimensions:
+                    all_scores[model_key][dim] = None
+                    all_per_clip[model_key][dim] = {}
                 continue
+            for dim in args.dimensions:
+                valid_tasks.append((model_key, dim, video_dir))
 
-            aggregate, per_clip = _run_vbench_for_model(
-                model_key=model_key,
-                model_name=model_name,
-                video_dir=video_dir,
-                dimensions=args.dimensions,
-                vbench_mode=args.vbench_mode,
-                output_dir=output_dir,
-            )
-            all_scores[model_key] = aggregate
-            all_per_clip[model_key] = per_clip
+        # GPU slot 池
+        gpu_pool: Queue = Queue()
+        for gid in gpu_ids:
+            gpu_pool.put(str(gid))
+
+        def _run_task(model_key, dim, video_dir):
+            model_name = model_configs[model_key].get("name", model_key)
+            gpu_id = gpu_pool.get()
+            try:
+                score, clip_scores = _run_vbench_single_dim(
+                    model_key, model_name, video_dir, dim,
+                    args.vbench_mode, output_dir, gpu_id
+                )
+                return model_key, dim, score, clip_scores
+            finally:
+                gpu_pool.put(gpu_id)
+
+        with ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+            futures = {
+                executor.submit(_run_task, mk, d, vd): (mk, d)
+                for (mk, d, vd) in valid_tasks
+            }
+            for fut in as_completed(futures):
+                mk, d = futures[fut]
+                try:
+                    mk, d, score, clip_scores = fut.result()
+                except Exception as e:
+                    logger.warning(f"[{mk}] dim={d} 评测异常：{e}，结果置 None")
+                    score, clip_scores = None, {}
+                all_scores[mk][d] = score
+                all_per_clip[mk][d] = clip_scores
     else:
         logger.info("--skip_vbench 已设置，跳过 VBench 评分阶段。")
 
@@ -965,6 +1223,41 @@ def main():
             output_dir=output_dir,
             model_video_dirs=model_video_dirs,
         )
+
+        # ---- 4c：追加到跨 run 注册表 all_runs.csv ----
+        new_rows = []
+        for mk in available_models:
+            for dim in args.dimensions:
+                clip_scores = all_per_clip.get(mk, {}).get(dim, {})
+                if clip_scores:
+                    for clip_id, score in clip_scores.items():
+                        new_rows.append({
+                            "run_name": run_name,
+                            "clip_id": clip_id,
+                            "dimension": dim,
+                            "score": "" if score is None else f"{score:.6f}",
+                        })
+                else:
+                    # 无 per-clip，仅写 aggregate
+                    agg_score = (all_scores.get(mk) or {}).get(dim)
+                    new_rows.append({
+                        "run_name": run_name,
+                        "clip_id": "_aggregate",
+                        "dimension": dim,
+                        "score": "" if agg_score is None else f"{agg_score:.6f}",
+                    })
+
+        if new_rows:
+            write_header = not all_runs_csv.exists()
+            with open(all_runs_csv, "a", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["run_name", "clip_id", "dimension", "score"]
+                )
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(new_rows)
+            logger.info(f"已追加 {len(new_rows)} 行到 {all_runs_csv}")
+            _update_comparison_files(comparison_dir, all_runs_csv)
     else:
         logger.info("无评分数据可汇总（仅执行了推理或全部跳过）。")
 

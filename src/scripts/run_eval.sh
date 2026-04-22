@@ -5,30 +5,29 @@ set -euo pipefail
 # 用户配置区 — 修改以下变量后运行 bash run_eval.sh
 # ============================================================
 
-TEST_IMAGES_DIR="eval_data/images/"         # 测试图片目录（.jpg/.png）
-TEST_TRAJ_DIR="eval_data/trajectories/"     # 相机轨迹目录（与图片同名，后缀不限）
-MODEL_CONFIG="eval_model_configs.yaml"      # 模型配置 YAML 路径
+# [选项A] Demo 模式：已有视频文件夹（非空 → 跳过推理，直接评分）
+VIDEO_DIR="/home/nvme02/wlx/Memory/outputs/inference/v3_stage1_dual_epoch_5_mem_n5"   # 示例: /home/nvme02/wlx/Memory/outputs/inference/v3_stage1_dual_epoch_5_mem_n5
 
-# 评测运行名称（用于区分不同次评测，建议填入日期+简短描述）
-# 留空则自动用时间戳（格式 YYYYMMDD_HHMMSS）
-EVAL_RUN_NAME=""
+# [选项B] Full pipeline 模式（VIDEO_DIR 留空时生效；命名逻辑与 run_infer_v3.sh 对齐）
+CKPT_DIR=""                  # 基础模型目录（必填，full pipeline 模式）
+FT_MODEL_DIR=""              # 全参微调 / dual-low 目录（如 .../low_noise_model/epoch_5）
+FT_HIGH_MODEL_DIR=""         # dual-high 目录（有值时视为 dual 模式，FT_MODEL_DIR 也必须填）
+USE_MEMORY=true              # 是否启用 Memory Bank
+LORA_PATH=""                 # LoRA 权重路径（可选）
+NUM_CLIPS=5                  # 连续推理 clip 数（影响 run_name 命名）
+INFER_SCRIPT="src/pipeline/infer_v3.py"  # 推理脚本（相对项目根目录）
 
-# 跳过开关（设为 true 可单独跑推理或单独跑评分）
-SKIP_INFERENCE=false   # true：跳过推理，直接对已有视频评分
-SKIP_VBENCH=false      # true：跳过 VBench，只做推理
-
-# 要评测的模型 key（空格分隔，需与 eval_model_configs.yaml 中的 key 一致）
-MODELS="baseline groupB groupC"
-
-# VBench 评测维度（对应论文 Table 2 的 6 个维度）
-DIMENSIONS="imaging_quality aesthetic_quality dynamic_degree motion_smoothness temporal_flickering subject_consistency"
-
-# 推理参数
+# 推理参数（full pipeline 和 demo 均用于 VBench）
+TEST_IMAGES_DIR="eval_data/images/"       # 测试图片目录（full pipeline 推理用）
+TEST_TRAJ_DIR="eval_data/trajectories/"  # 相机轨迹目录（full pipeline 推理用）
 FRAME_NUM=81
 SIZE="480*832"
 PROMPT="First-person view of CS:GO competitive gameplay"
 
-CUDA_VISIBLE_DEVICES="0"   # 使用哪张 GPU，例如 "0"、"0,1"
+# VBench 评测维度（对应论文 Table 2 的 6 个维度）
+DIMENSIONS="imaging_quality aesthetic_quality dynamic_degree motion_smoothness temporal_flickering subject_consistency"
+
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"   # 使用哪些 GPU
 
 # ============================================================
 # 以下内容通常无需修改
@@ -42,40 +41,50 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 EVAL_SCRIPT="${PROJECT_ROOT}/src/pipeline/eval_vbench.py"
 
-# ---------- EVAL_RUN_NAME 默认为时间戳 ----------
-if [ -z "${EVAL_RUN_NAME}" ]; then
-    EVAL_RUN_NAME="$(date +%Y%m%d_%H%M%S)"
+# ---------- RUN_NAME 推导（与 run_infer_v3.sh 命名逻辑对齐）----------
+if [ -n "${VIDEO_DIR}" ]; then
+    # demo 模式：取视频文件夹 basename
+    RUN_NAME="$(basename "${VIDEO_DIR}")"
+else
+    # full pipeline 模式：与 run_infer_v3.sh 完全相同的 EXP_NAME 逻辑
+    if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
+        _train_dir="$(basename "$(dirname "$(dirname "${FT_MODEL_DIR}")")")"
+        _epoch="$(basename "${FT_MODEL_DIR}")"
+        _base_exp="${_train_dir}_${_epoch}"
+    elif [ -n "${FT_MODEL_DIR}" ]; then
+        _train_dir="$(basename "$(dirname "${FT_MODEL_DIR}")")"
+        _epoch="$(basename "${FT_MODEL_DIR}")"
+        _base_exp="${_train_dir}_${_epoch}"
+    else
+        _base_exp="baseline"
+    fi
+
+    if [ -n "${FT_HIGH_MODEL_DIR}" ] || [ -n "${FT_MODEL_DIR}" ]; then
+        if [ "${USE_MEMORY}" = "true" ]; then
+            _base_exp="${_base_exp}_mem"
+        else
+            _base_exp="${_base_exp}_nomem"
+        fi
+    else
+        if [ "${USE_MEMORY}" = "true" ]; then
+            _base_exp="baseline_mem"
+        else
+            _base_exp="baseline"
+        fi
+    fi
+    RUN_NAME="${_base_exp}_n${NUM_CLIPS}"
 fi
 
 # ---------- 推理结果根目录（与 run_infer_v3.sh 一致）----------
 OUTPUT_BASE="${PROJECT_ROOT}/outputs"
 
-# ---------- OUTPUT_DIR 追加 EVAL_RUN_NAME ----------
-OUTPUT_DIR="${OUTPUT_BASE}/eval_vbench/${EVAL_RUN_NAME}"
+# ---------- OUTPUT_DIR 使用 RUN_NAME ----------
+OUTPUT_DIR="${OUTPUT_BASE}/eval_vbench/${RUN_NAME}"
 
 # ---------- EVAL_SCRIPT 存在性检查 ----------
 if [ ! -f "${EVAL_SCRIPT}" ]; then
     echo "[ERROR] eval_vbench.py 不存在：${EVAL_SCRIPT}" >&2
     echo "请确认项目目录结构完整。" >&2
-    exit 1
-fi
-
-# ---------- MODEL_CONFIG 路径检查 ----------
-# 若为相对路径，则相对 PROJECT_ROOT 解析
-if [[ "${MODEL_CONFIG}" != /* ]]; then
-    MODEL_CONFIG="${PROJECT_ROOT}/${MODEL_CONFIG}"
-fi
-
-if [ ! -f "${MODEL_CONFIG}" ]; then
-    echo "====================================================="
-    echo "  [提示] 模型配置文件不存在：${MODEL_CONFIG}"
-    echo ""
-    echo "  请先运行以下命令自动生成配置模板："
-    echo "    python ${EVAL_SCRIPT} --model_config ${MODEL_CONFIG}"
-    echo ""
-    echo "  生成模板后，填写各模型的 ckpt_dir、infer_script 等字段，"
-    echo "  再重新运行本脚本。"
-    echo "====================================================="
     exit 1
 fi
 
@@ -100,42 +109,40 @@ fi
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement — VBench 评测"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
-echo "  EVAL_RUN_NAME   : ${EVAL_RUN_NAME}"
+echo "  RUN_NAME        : ${RUN_NAME}"
+echo "  VIDEO_DIR       : ${VIDEO_DIR}"
 echo "  TEST_IMAGES_DIR : ${TEST_IMAGES_DIR}"
 echo "  TEST_TRAJ_DIR   : ${TEST_TRAJ_DIR}"
 echo "  OUTPUT_DIR      : ${OUTPUT_DIR}"
-echo "  MODEL_CONFIG    : ${MODEL_CONFIG}"
-echo "  MODELS          : ${MODELS}"
-echo "  SKIP_INFERENCE  : ${SKIP_INFERENCE}"
-echo "  SKIP_VBENCH     : ${SKIP_VBENCH}"
 echo "  LOG_FILE        : ${LOG_FILE}"
 echo "====================================================="
 
 # ---------- 拼接评测命令 ----------
 # shellcheck disable=SC2206
-MODELS_ARRAY=( ${MODELS} )
-# shellcheck disable=SC2206
 DIMENSIONS_ARRAY=( ${DIMENSIONS} )
 
 CMD=(
     python "${EVAL_SCRIPT}"
+    --run_name         "${RUN_NAME}"
     --test_images_dir  "${TEST_IMAGES_DIR}"
     --test_traj_dir    "${TEST_TRAJ_DIR}"
     --output_dir       "${OUTPUT_DIR}"
-    --model_config     "${MODEL_CONFIG}"
-    --models           "${MODELS_ARRAY[@]}"
     --dimensions       "${DIMENSIONS_ARRAY[@]}"
     --frame_num        "${FRAME_NUM}"
     --size             "${SIZE}"
     --prompt           "${PROMPT}"
 )
 
-if [ "${SKIP_INFERENCE}" = "true" ]; then
-    CMD+=(--skip_inference)
-fi
-
-if [ "${SKIP_VBENCH}" = "true" ]; then
-    CMD+=(--skip_vbench)
+if [ -n "${VIDEO_DIR}" ]; then
+    CMD+=(--video_dir "${VIDEO_DIR}")
+else
+    # full pipeline 参数
+    CMD+=(--infer_script "${PROJECT_ROOT}/${INFER_SCRIPT}")
+    if [ -n "${CKPT_DIR}" ];          then CMD+=(--ckpt_dir "${CKPT_DIR}"); fi
+    if [ -n "${FT_MODEL_DIR}" ];      then CMD+=(--ft_model_dir "${FT_MODEL_DIR}"); fi
+    if [ -n "${FT_HIGH_MODEL_DIR}" ]; then CMD+=(--ft_high_model_dir "${FT_HIGH_MODEL_DIR}"); fi
+    if [ "${USE_MEMORY}" = "true" ];  then CMD+=(--use_memory); fi
+    if [ -n "${LORA_PATH}" ];         then CMD+=(--lora_path "${LORA_PATH}"); fi
 fi
 
 echo "执行命令："
