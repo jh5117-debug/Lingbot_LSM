@@ -13,15 +13,15 @@ set -euo pipefail
 #   - 新增全量 ThreeTierMemoryBank 超参数（10 个）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit"
+IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path/image.jpg"
+ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path"
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
 LORA_PATH=""             # LoRA 权重路径（lora_weights.pth）
-FT_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v3_stage1_dual/low_noise_model/epoch_5"
+FT_MODEL_DIR=""
                          # 全参微调 / dual-low 目录（如 .../train_v3_stage1_dual/low_noise_model/epoch_5）
-FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v3_stage1_dual/high_noise_model/epoch_5"
+FT_HIGH_MODEL_DIR=""
                          # dual-high 目录（如 .../train_v3_stage1_dual/high_noise_model/epoch_5）
                          # FT_HIGH_MODEL_DIR 有值时视为 dual 模式，此时 FT_MODEL_DIR 也必须填写
 
@@ -30,7 +30,7 @@ FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
 NUM_CLIPS=5             # v3 默认 12 clip 连续推理（v2 为 2）
                          # 确保 ACTION_PATH 内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS
 # Memory 模块开关（false = baseline 纯基础模型推理；true = 启用 ThreeTierMemoryBank）
-USE_MEMORY=true
+USE_MEMORY=false
 SAMPLE_STEPS=40
 SAMPLE_SHIFT=10.0
 GUIDE_SCALE=5.0
