@@ -629,14 +629,18 @@ def _parse_vbench_result(result_dir: Path, dimension: str) -> Optional[float]:
                 if "dimension_score" in data:
                     return float(data["dimension_score"])
 
-                # 典型格式：{dimension: [[per_video_scores], aggregate_score]}
+                # VBench custom_input 格式：{dimension: [aggregate_score, [per_video_list]]}
                 if dimension in data:
                     value = data[dimension]
-                    if isinstance(value, list) and len(value) >= 2:
-                        # aggregate_score 通常在第二位
-                        return float(value[1])
-                    elif isinstance(value, (int, float)):
+                    if isinstance(value, (int, float)):
                         return float(value)
+                    elif isinstance(value, list) and len(value) >= 1:
+                        # index 0 = aggregate, index 1 = per-video list
+                        if isinstance(value[0], (int, float)):
+                            return float(value[0])
+                        # 旧版格式：[[per_video_scores], aggregate_score]
+                        elif len(value) >= 2 and isinstance(value[1], (int, float)):
+                            return float(value[1])
 
                 # 备用：直接取 "score" 键
                 if "score" in data:
@@ -683,14 +687,31 @@ def _parse_vbench_per_clip(
             with open(candidate, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            clip_scores: Dict[str, Optional[float]] = {}
+
+            # VBench custom_input 格式：{dimension: [aggregate_score, [{video_path, video_results}, ...]]}
+            if dimension in data:
+                dim_value = data[dimension]
+                if isinstance(dim_value, list) and len(dim_value) >= 2 and isinstance(dim_value[1], list):
+                    for entry in dim_value[1]:
+                        if isinstance(entry, dict):
+                            filename = str(entry.get("video_path", ""))
+                            try:
+                                score = float(entry.get("video_results", None))
+                            except (TypeError, ValueError):
+                                score = None
+                            clip_name = _normalize_clip_name(filename)
+                            clip_scores[clip_name] = score
+                    if clip_scores:
+                        return clip_scores
+
+            # 备用：顶层 video_results 键
             video_results = data.get("video_results")
             if video_results is None:
                 continue
 
-            clip_scores: Dict[str, Optional[float]] = {}
-
             if isinstance(video_results, list):
-                # 格式 1: [[filename, score], ...]
+                # 格式: [[filename, score], ...]
                 for entry in video_results:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                         filename = str(entry[0])
@@ -702,7 +723,7 @@ def _parse_vbench_per_clip(
                         clip_scores[clip_name] = score
 
             elif isinstance(video_results, dict):
-                # 格式 2: {"filename.mp4": score, ...}
+                # 格式: {"filename.mp4": score, ...}
                 for filename, raw_score in video_results.items():
                     try:
                         score = float(raw_score)
