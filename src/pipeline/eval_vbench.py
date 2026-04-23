@@ -543,7 +543,7 @@ def _run_vbench_single_dim(
     """对单个模型的单个 VBench 维度评分，在指定 GPU 上运行。
     返回 (dim_score, dim_clip_scores)。
     """
-    vbench_result_dir = output_dir / "vbench_results" / model_key
+    vbench_result_dir = output_dir / "vbench_results" / model_key / dim
     vbench_result_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
@@ -616,6 +616,8 @@ def _parse_vbench_result(result_dir: Path, dimension: str) -> Optional[float]:
         result_dir / f"results_{dimension}.json",
         result_dir / "results.json",
     ]
+    # VBench custom_input 模式实际保存为 results_<timestamp>_eval_results.json
+    candidates += sorted(result_dir.glob("results_*_eval_results.json"), reverse=True)
 
     for candidate in candidates:
         if candidate.exists():
@@ -670,6 +672,8 @@ def _parse_vbench_per_clip(
         result_dir / f"results_{dimension}.json",
         result_dir / "results.json",
     ]
+    # VBench custom_input 模式实际保存为 results_<timestamp>_eval_results.json
+    candidates += sorted(result_dir.glob("results_*_eval_results.json"), reverse=True)
 
     for candidate in candidates:
         if not candidate.exists():
