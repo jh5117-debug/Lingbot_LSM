@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 
 # [选项A] Demo 模式：已有视频文件夹（非空 → 跳过推理，直接评分）
-VIDEO_DIR="/home/nvme02/wlx/Memory/outputs/inference/v3_stage1_dual_epoch_5_mem_n5"   # 示例: /home/nvme02/wlx/Memory/outputs/inference/v3_stage1_dual_epoch_5_mem_n5
+VIDEO_DIR="/home/nvme02/wlx/Memory/outputs/inference/baseline_n5"   # 示例: /home/nvme02/wlx/Memory/outputs/inference/v3_stage1_dual_epoch_5_mem_n5
 
 # [选项B] Full pipeline 模式（VIDEO_DIR 留空时生效；命名逻辑与 run_infer_v3.sh 对齐）
 CKPT_DIR=""                  # 基础模型目录（必填，full pipeline 模式）
