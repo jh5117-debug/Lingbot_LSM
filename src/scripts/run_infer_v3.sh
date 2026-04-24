@@ -61,7 +61,7 @@ export CUDA_VISIBLE_DEVICES
 NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
 
 # Wan14B 固定 40 个 attention heads；Ulysses SP 要求 num_heads % GPU数 == 0
-if [ "${NUM_GPUS}" -gt 1 ] && [ "${USE_MEMORY}" = "true" ]; then
+if [ "${NUM_GPUS}" -gt 1 ]; then
     if [ $((40 % NUM_GPUS)) -ne 0 ]; then
         echo "[ERROR] Ulysses SP：${NUM_GPUS} 个 GPU 不能整除 Wan14B 的 40 个 attention heads（余数 $((40 % NUM_GPUS))）。" >&2
         echo "[ERROR] 请将 CUDA_VISIBLE_DEVICES 的 GPU 数量改为 40 的因数，推荐：1 / 2 / 4 / 5 / 8 / 10" >&2
@@ -197,8 +197,8 @@ if [ "${USE_MEMORY}" = "true" ]; then
 fi
 
 
-# ---------- 启动方式：多卡 Memory 模式用 torchrun，其余用 python ----------
-if [ "${USE_MEMORY}" = "true" ] && [ "${NUM_GPUS}" -gt 1 ]; then
+# ---------- 启动方式：多卡时用 torchrun（baseline 和 memory 模式均适用）----------
+if [ "${NUM_GPUS}" -gt 1 ]; then
     CMD+=(--ulysses_size "${NUM_GPUS}")
     CMD+=(--t5_fsdp)          # 多卡时对 T5 做 FSDP 分片，避免每卡复制全量 T5（~22 GiB）
     # 动态选取空闲端口，避免 EADDRINUSE
