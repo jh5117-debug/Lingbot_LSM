@@ -16,7 +16,7 @@ USE_MEMORY=true              # 是否启用 Memory Bank
 LORA_PATH=""                 # LoRA 权重路径（可选）
 NUM_CLIPS=5                  # 连续推理 clip 数（影响 run_name 命名）
 INFER_SCRIPT="src/pipeline/infer_v3.py"  # 推理脚本（相对项目根目录）
-FORCE=false                  # true = 忽略 all_runs.csv 缓存，强制重新评测
+FORCE=true                  # true = 忽略 all_runs.csv 缓存，强制重新评测
 
 # 推理参数（full pipeline 和 demo 均用于 VBench）
 TEST_IMAGES_DIR="eval_data/images/"       # 测试图片目录（full pipeline 推理用）
