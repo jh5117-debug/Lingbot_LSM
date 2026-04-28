@@ -227,6 +227,10 @@ def _parse_args():
         "--lora_path", type=str, default="",
         help="full pipeline 模式：LoRA 权重路径（可选）",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="强制重新评测，忽略 all_runs.csv 中的已有记录",
+    )
 
     return parser.parse_args()
 
@@ -1073,12 +1077,22 @@ def main():
     # ---- skip-if-exists ----
     if all_runs_csv.exists():
         with open(all_runs_csv, newline="") as _f:
-            _existing = {row["run_name"] for row in csv.DictReader(_f)}
+            _existing_rows = list(csv.DictReader(_f))
+        _existing = {row["run_name"] for row in _existing_rows}
         if run_name in _existing:
-            logger.info(
-                f"[{run_name}] 已在 _comparison/all_runs.csv 中存在，跳过本次评测。"
-            )
-            return
+            if not args.force:
+                logger.info(
+                    f"[{run_name}] 已在 _comparison/all_runs.csv 中存在，跳过本次评测。"
+                    "（传入 --force 可强制重新评测）"
+                )
+                return
+            # --force：先删除旧行，再重新评测
+            kept = [r for r in _existing_rows if r["run_name"] != run_name]
+            with open(all_runs_csv, "w", newline="") as _f:
+                writer = csv.DictWriter(_f, fieldnames=["run_name", "clip_id", "dimension", "score"])
+                writer.writeheader()
+                writer.writerows(kept)
+            logger.info(f"[{run_name}] --force：已从 all_runs.csv 删除旧记录，重新评测。")
 
     # 过滤请求的模型（无 YAML 单次模式：model_keys 已在上方构造）
     if args.video_dir or args.infer_script or args.ft_model_dir:
