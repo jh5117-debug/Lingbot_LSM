@@ -1404,9 +1404,11 @@ def multi_clip_training_step(
     else:
         retrieved = None
 
+    _retrieved_k: int = 0  # 记录实际检索到的帧数（0 表示 retrieve 失败或 bank 为空）
     if retrieved is not None:
         # Innovation 10: 解包三元组 (key_states, value_states, tier_ids)
         key_states, value_states, tier_ids = retrieved
+        _retrieved_k = key_states.shape[0]  # 记录实际检索帧数
         assert key_states.shape[0] <= 6, (
             f"retrieve() returned {key_states.shape[0]} > 6 frames"
         )
@@ -1529,12 +1531,18 @@ def multi_clip_training_step(
             _latent_proj_loss_val = _latent_proj_loss.item()  # M-01：保存 latent_proj loss 标量
             total_loss = total_loss + 0.05 * _latent_proj_loss
 
-    return total_loss, {
+    # 诊断 key（不参与 loss 计算和 W&B 上报，仅供日志使用）
+    _loss_components: Dict[str, float] = {
         "diffusion": _diffusion_loss_val,
         "nfp": _nfp_loss_val,
         "vis_align": _vis_align_loss_val,
         "latent_proj": _latent_proj_loss_val,
     }
+    _loss_components["bank_short"]       = float(len(bank.short.frames))
+    _loss_components["bank_medium"]      = float(len(bank.medium.frames))
+    _loss_components["bank_long"]        = float(len(bank.long.frames))
+    _loss_components["bank_retrieved_k"] = float(_retrieved_k)
+    return total_loss, _loss_components
 
 
 # ============================================================
@@ -1836,6 +1844,9 @@ def main():
             torch.cuda.empty_cache()
             epoch_loss = 0.0
             num_batches = 0
+            epoch_diffusion_loss = 0.0
+            epoch_nfp_loss       = 0.0
+            epoch_vis_loss       = 0.0
 
             progress = tqdm(
                 dataloader,
@@ -1939,13 +1950,31 @@ def main():
                     continue
 
                 epoch_loss += loss.item()
+                epoch_diffusion_loss += _loss_components["diffusion"]
+                epoch_nfp_loss       += _loss_components["nfp"]
+                epoch_vis_loss       += _loss_components["vis_align"]
                 num_batches += 1
                 global_step += 1
 
                 progress.set_postfix(
                     loss=f"{loss.item():.4f}",
+                    nfp=f"{_loss_components['nfp']:.4f}",
                     lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                 )
+
+                if accelerator.is_main_process and global_step % 10 == 0:
+                    _gate_val = accelerator.unwrap_model(model).blocks[0].memory_cross_attn._last_gate_value
+                    logger.info(
+                        f"step {global_step} | n_ctx={_synced_n_ctx} | gate={_gate_val:.4f} | "
+                        f"bank=[{int(_loss_components.get('bank_short', 0))}s/"
+                        f"{int(_loss_components.get('bank_medium', 0))}m/"
+                        f"{int(_loss_components.get('bank_long', 0))}l] "
+                        f"retr={int(_loss_components.get('bank_retrieved_k', 0))} | "
+                        f"loss={loss.item():.4f} "
+                        f"(diff={_loss_components['diffusion']:.4f} "
+                        f"nfp={_loss_components['nfp']:.4f} "
+                        f"vis={_loss_components['vis_align']:.4f})"
+                    )
 
                 # 定期保存 checkpoint
                 if args.save_steps and global_step % args.save_steps == 0:
@@ -1963,9 +1992,12 @@ def main():
             if accelerator.is_main_process:
                 logging.info(
                     f"Epoch {epoch+1}/{args.num_epochs} | "
-                    f"avg_loss: {avg_loss:.4f} | "
-                    f"lr: {lr_scheduler.get_last_lr()[0]:.2e} | "
-                    f"stage: {args.stage}"
+                    f"avg_loss={avg_loss:.4f} "
+                    f"(diff={epoch_diffusion_loss/max(num_batches,1):.4f} "
+                    f"nfp={epoch_nfp_loss/max(num_batches,1):.4f} "
+                    f"vis={epoch_vis_loss/max(num_batches,1):.4f}) | "
+                    f"lr={lr_scheduler.get_last_lr()[0]:.2e} | "
+                    f"stage={args.stage}"
                 )
 
             if (epoch + 1) % args.save_every_n_epochs == 0:

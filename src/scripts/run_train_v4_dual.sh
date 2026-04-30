@@ -180,7 +180,7 @@ for _EPOCH in $(seq "${_LOW_START}" "${NUM_EPOCHS}"); do
         accelerate launch "${COMMON_ARGS[@]}"
         "${TRAIN_SCRIPT}"
         "${TRAIN_ARGS[@]}"
-        --num_epochs "${_EPOCH}"
+        --num_epochs "${NUM_EPOCHS}"
         --model_type low
     )
     if [ -n "${_LOW_RESUME}" ]; then
@@ -224,7 +224,7 @@ for _EPOCH in $(seq "${_HIGH_START}" "${NUM_EPOCHS}"); do
         accelerate launch "${COMMON_ARGS[@]}"
         "${TRAIN_SCRIPT}"
         "${TRAIN_ARGS[@]}"
-        --num_epochs "${_EPOCH}"
+        --num_epochs "${NUM_EPOCHS}"
         --model_type high
     )
     if [ -n "${_HIGH_RESUME}" ]; then
