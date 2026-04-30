@@ -103,9 +103,9 @@ class MemoryCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-        # Zero-init gate：初始化为 0，训练过程中学习打开
-        # 参考 WorldMem dit.py L304 gate 机制；初始化为 0 保证训练初期 memory 分支无输出
-        self.gate = nn.Parameter(torch.zeros(1))
+        # 0.1-init gate：初始化为 0.1，使 memory 从训练开始就有微弱贡献，避免 W_q/W_k/W_v/W_o 梯度恒为 0
+        # 参考 WorldMem dit.py L304 gate 机制；gate=0.1 → memory 初始有 ~10% 贡献，梯度路径打通（F-08 fix）
+        self.gate = nn.Parameter(torch.ones(1) * 0.1)
 
         # Innovation 10：Tier Embedding — 告知模型检索帧来自 Short/Medium/Long 层
         # 0=Short（连续性锚点），1=Medium（动态事件），2=Long（稳定场景）
@@ -191,5 +191,5 @@ class MemoryCrossAttention(nn.Module):
         with torch.no_grad():
             self._last_attn_out_norm = out.detach().norm().item()
             self._last_gate_value = self.gate.item()
-        # Gate 缩放：初始化为 0，训练过程中逐渐打开
+        # Gate 缩放：初始化为 0.1，训练过程中逐渐调整（F-08 fix）
         return self.gate * out

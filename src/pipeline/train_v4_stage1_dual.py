@@ -207,6 +207,7 @@ class CSGOMultiClipDataset(Dataset):
         self,
         dataset_dir: str,
         split: str = "train",
+        phase: str = "exp",
         max_context_clips: int = 6,  # Innovation 6: 改为 max_context_clips
         num_frames: int = 81,
         height: int = 480,
@@ -215,8 +216,9 @@ class CSGOMultiClipDataset(Dataset):
     ):
         """
         Args:
-            dataset_dir:        数据集根目录（含 metadata_{split}.csv）
+            dataset_dir:        数据集根目录（含 metadata_{phase}_{split}.csv）
             split:              "train" / "val"
+            phase:              训练阶段，"exp"（ep01-11）或 "full"（ep01-46）；CSV 路径为 metadata_{phase}_{split}.csv
             max_context_clips:  最大 context clip 数量；window_size = max_context_clips + 1
             num_frames:         每个 clip 的帧数（81）
             height:             视频高度
@@ -225,6 +227,7 @@ class CSGOMultiClipDataset(Dataset):
         """
         self.dataset_dir = dataset_dir
         self.split = split
+        self.phase = phase
         self.max_context_clips = max_context_clips
         # Innovation 6: window_size = max_context_clips + 1（返回足够多 clip，训练时随机截取）
         self.num_clips = max_context_clips + 1
@@ -233,7 +236,7 @@ class CSGOMultiClipDataset(Dataset):
         self.width = width
         self.repeat = repeat
 
-        csv_path = os.path.join(dataset_dir, f"metadata_{split}.csv")
+        csv_path = os.path.join(dataset_dir, f"metadata_{phase}_{split}.csv")
         self._build_episode_groups(csv_path)
         logging.info(
             f"CSGOMultiClipDataset(v4): {len(self.samples)} valid episode windows "
@@ -247,6 +250,11 @@ class CSGOMultiClipDataset(Dataset):
         退化规则：
           - 若 CSV 无 episode_id 列 → 用 clip_path 的父目录名作为 episode_id
           - 若 CSV 有 stem 列 → 按 stem 排序；否则按 clip_path 字母序
+
+        注意：metadata_all.csv 中的列语义：
+          - episode_id（字符串，如 "player01_ep01"）：clip 的所属 episode 标识符，本方法用于分组
+          - episode_idx（整数，1-46）：episode 的全局编号，供 prepare_v4_splits.py 按 phase 过滤使用
+          二者是不同列，功能不同。
         """
         all_rows = []
         with open(csv_path, "r") as f:
@@ -254,6 +262,18 @@ class CSGOMultiClipDataset(Dataset):
             fieldnames = reader.fieldnames or []
             has_episode_id = "episode_id" in fieldnames
             has_stem = "stem" in fieldnames
+            has_clip_idx = "clip_idx" in fieldnames
+            if not has_episode_id:
+                raise ValueError(
+                    f"CSV '{csv_path}' missing required column 'episode_id'. "
+                    "v4 数据集 metadata_all.csv 必须包含 'episode_id'（字符串标识符，如 player01_ep01）列。"
+                )
+            if not has_clip_idx:
+                raise ValueError(
+                    f"CSV '{csv_path}' missing required column 'clip_idx'. "
+                    "v4 数据集 metadata_all.csv 必须包含 'clip_idx'（整数，clip 在 episode 内的序号）列。"
+                )
+            # assert 保证此处 has_episode_id 始终为 True，退化路径保留以兼容旧格式 CSV
             for row in reader:
                 all_rows.append(row)
 
@@ -270,10 +290,12 @@ class CSGOMultiClipDataset(Dataset):
                 ep_id = os.path.dirname(row.get("clip_path", ""))
             episode_clips[ep_id].append(row)
 
-        # 对每个 episode 的 clips 排序
+        # 对每个 episode 的 clips 排序（优先按 clip_idx 整数排序，回退到 stem，再回退到 clip_path）
         for ep_id in episode_clips:
             clips = episode_clips[ep_id]
-            if has_stem:
+            if has_clip_idx:
+                clips.sort(key=lambda r: int(r.get("clip_idx", 0)))
+            elif has_stem:
                 clips.sort(key=lambda r: r.get("stem", ""))
             else:
                 clips.sort(key=lambda r: r.get("clip_path", ""))
@@ -290,8 +312,8 @@ class CSGOMultiClipDataset(Dataset):
                     ep_id, n, self.num_clips,
                 )
                 continue
-            # 使用滑动窗口，每隔 num_clips 步取一个窗口（不重叠）
-            for start in range(0, n - self.num_clips + 1, self.num_clips):
+            # 使用重叠滑动窗口，stride=1（v4 数据集预生成 6524 overlapping windows，充分利用所有窗口）
+            for start in range(0, n - self.num_clips + 1, 1):
                 window = clips[start: start + self.num_clips]
                 self.samples.append(window)
 
@@ -316,9 +338,12 @@ class CSGOMultiClipDataset(Dataset):
         window = self.samples[idx % len(self.samples)]
         clips_data = []
         for row in window:
-            clip_dir = os.path.join(self.dataset_dir, row["clip_path"])
+            ep_id = row["episode_id"]
+            clip_idx = int(row["clip_idx"])
+            clip_rel = f"clips/{ep_id}/{ep_id}_clip{clip_idx:02d}"
+            clip_dir = os.path.join(self.dataset_dir, clip_rel)
             try:
-                data = self._load_single_clip(clip_dir, row)
+                data = self._load_single_clip(clip_dir, clip_rel, row)
                 clips_data.append(data)
             except Exception as e:
                 logging.warning(
@@ -329,8 +354,14 @@ class CSGOMultiClipDataset(Dataset):
                 return self.__getitem__(next_idx)
         return clips_data
 
-    def _load_single_clip(self, clip_dir: str, row: dict) -> dict:
-        """加载单个 clip，返回与 CSGODataset.__getitem__ 格式相同的 dict。"""
+    def _load_single_clip(self, clip_dir: str, clip_rel: str, row: dict) -> dict:
+        """加载单个 clip，返回与 CSGODataset.__getitem__ 格式相同的 dict。
+
+        Args:
+            clip_dir:   clip 的绝对路径（由 dataset_dir + clip_rel 构成）
+            clip_rel:   clip 的相对路径（Method B 约定：clips/{ep_id}/{ep_id}_clip{idx:02d}）
+            row:        CSV 行 dict（用于读取 prompt 等元数据）
+        """
         import cv2
 
         video_path = os.path.join(clip_dir, "video.mp4")
@@ -369,7 +400,7 @@ class CSGOMultiClipDataset(Dataset):
             "poses": torch.from_numpy(poses).float(),
             "actions": torch.from_numpy(actions).float(),
             "intrinsics": torch.from_numpy(intrinsics).float(),
-            "clip_path": row.get("clip_path", ""),
+            "clip_path": clip_rel,
         }
 
 
@@ -991,7 +1022,7 @@ def multi_clip_training_step(
     model: nn.Module,
     batch_clips: List[dict],
     args,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """多 clip 顺序训练步骤（v4：Innovations 6/7/8/9/10）。
 
     args:
@@ -1001,7 +1032,9 @@ def multi_clip_training_step(
         args:        argparse.Namespace
 
     返回：
-        total_loss:  Tensor scalar，用于 accelerator.backward(loss)
+        total_loss:          Tensor scalar，用于 accelerator.backward(loss)
+        _loss_components:    Dict[str, float]，各分量标量值（diffusion/nfp/vis_align/latent_proj），
+                             未计算的分量填 0.0，供 W&B 精细报告（M-01 修复）
 
     Innovation 6 — 随机 N-clip：
         n_ctx = random.randint(2, args.max_context_clips)  每 step 随机采样
@@ -1320,6 +1353,23 @@ def multi_clip_training_step(
             dim=-1,
         )  # [5120], grad 流经 visual_key_proj.weight
 
+    # [H-01 fix] latent_proj 梯度路径（对称 Innovation 9 的 _vis_proj_for_grad 模式）
+    # get_projected_latent_emb 在 no_grad 内调用（上方 with torch.no_grad() 块），latent_proj 无梯度。
+    # 此处在 no_grad 外对同一帧重新调用，建立 latent_proj.weight 的梯度路径。
+    # 即使输入 video_latent[:, 0] 是 detached tensor（来自 VAE encode），权重梯度仍能积累。
+    _latent_proj_for_grad: Optional[torch.Tensor] = None
+    if hasattr(model, "latent_proj") and model.latent_proj.weight.requires_grad:
+        _first_frame_latent = video_latent[:, 0].detach()  # [z_dim=16, lat_h, lat_w]
+        _latent_proj_for_grad = torch.nn.functional.normalize(
+            model.latent_proj(
+                _first_frame_latent.to(
+                    device=model.latent_proj.weight.device,
+                    dtype=model.latent_proj.weight.dtype,
+                ).mean(dim=[-2, -1])  # [z_dim=16] 空间平均，与 get_projected_latent_emb 逻辑一致
+            ),
+            dim=-1,
+        )  # [5120], grad 流经 latent_proj.weight
+
     # ----------------------------------------------------------------
     # Innovation 7：Context Drop-off（retrieve 之前，对三层随机丢弃部分 entries）
     # 模拟推理初期 bank 稀疏状态（借鉴 MoC arXiv 2508.21058）
@@ -1398,6 +1448,12 @@ def multi_clip_training_step(
 
     hook_handle = last_block.register_forward_hook(_nfp_hook)
 
+    # M-01 修复：各分量标量初始值（未计算时保持 0.0，防止 NameError）
+    _diffusion_loss_val: float = 0.0
+    _nfp_loss_val: float = 0.0
+    _vis_align_loss_val: float = 0.0
+    _latent_proj_loss_val: float = 0.0
+
     try:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred = model(
@@ -1416,6 +1472,7 @@ def multi_clip_training_step(
         target_rest = target[:, 1:]
         diffusion_loss = F.mse_loss(pred_rest, target_rest.to(pred_rest.dtype))
         diffusion_loss = diffusion_loss * training_weight
+        _diffusion_loss_val = diffusion_loss.item()  # M-01：保存纯 diffusion loss 标量
 
         # NFP Loss（只在 target clip 计算，与 v3_dual 对齐）
         nfp_loss_weight = args.nfp_loss_weight
@@ -1434,6 +1491,7 @@ def multi_clip_training_step(
                 mse_weight=1.0, cosine_weight=1.0,
             )
             nfp_loss = nfp_loss_dict['total']
+            _nfp_loss_val = nfp_loss.item()  # M-01：保存 nfp loss 标量
             total_loss = diffusion_loss + nfp_loss_weight * nfp_loss
         else:
             total_loss = diffusion_loss
@@ -1441,21 +1499,39 @@ def multi_clip_training_step(
     finally:
         hook_handle.remove()
 
-    # [Innovation 9] visual_key_proj 辅助对齐 loss（梯度路径，对应 latent_proj 的 dummy_memory_v 作用）
-    # 训练 visual_key_proj 使其输出对齐 K 投影空间（cosine 对齐与 pose_key）
-    if _vis_proj_for_grad is not None:
+    # [Innovation 9 + H-01 fix] 辅助对齐 loss（visual_key_proj 和 latent_proj 梯度路径）
+    # 共用同一个 _pose_key_ref（只计算一次，避免重复 get_semantic_key 调用）
+    if _vis_proj_for_grad is not None or _latent_proj_for_grad is not None:
         with torch.no_grad():
             _pose_key_ref = model.get_semantic_key(query_pose_emb)  # pose-only，detached [5120]
-        _vis_align_loss = (
-            1.0
-            - torch.nn.functional.cosine_similarity(
-                _vis_proj_for_grad.to(_pose_key_ref.device, _pose_key_ref.dtype).unsqueeze(0),
-                _pose_key_ref.unsqueeze(0),
-            )
-        ).clamp(min=0.0).mean()
-        total_loss = total_loss + 0.05 * _vis_align_loss
+        if _vis_proj_for_grad is not None:
+            _vis_align_loss = (
+                1.0
+                - torch.nn.functional.cosine_similarity(
+                    _vis_proj_for_grad.to(_pose_key_ref.device, _pose_key_ref.dtype).unsqueeze(0),
+                    _pose_key_ref.unsqueeze(0),
+                )
+            ).clamp(min=0.0).mean()
+            _vis_align_loss_val = _vis_align_loss.item()  # M-01：保存 vis_align loss 标量
+            total_loss = total_loss + 0.05 * _vis_align_loss
+        if _latent_proj_for_grad is not None:
+            # _latent_proj_for_grad shape: [5120]（与 _vis_proj_for_grad 完全对称，无 batch 维度）
+            _latent_proj_loss = (
+                1.0
+                - torch.nn.functional.cosine_similarity(
+                    _latent_proj_for_grad.to(_pose_key_ref.device, _pose_key_ref.dtype).unsqueeze(0),
+                    _pose_key_ref.unsqueeze(0),
+                )
+            ).clamp(min=0.0).mean()
+            _latent_proj_loss_val = _latent_proj_loss.item()  # M-01：保存 latent_proj loss 标量
+            total_loss = total_loss + 0.05 * _latent_proj_loss
 
-    return total_loss
+    return total_loss, {
+        "diffusion": _diffusion_loss_val,
+        "nfp": _nfp_loss_val,
+        "vis_align": _vis_align_loss_val,
+        "latent_proj": _latent_proj_loss_val,
+    }
 
 
 # ============================================================
@@ -1532,6 +1608,12 @@ def parse_args() -> argparse.Namespace:
                         help="W&B 模式：online/offline/disabled")
     parser.add_argument("--log_every_steps", type=int, default=10,
                         help="W&B 日志记录频率（每 N 步记录一次）")
+
+    # ---- v4 新增：训练阶段选择（exp / full 数据集）----
+    parser.add_argument("--phase", type=str, default="exp",
+                        choices=["exp", "full"],
+                        help="训练阶段：exp（ep01-11，小规模验证）/ full（ep01-46，全量训练）；"
+                             "决定 CSV 路径：metadata_{phase}_{split}.csv")
 
     # ---- v4 新增：随机 N-clip 训练参数（Innovation 6）----
     # 注：v3 的 --num_context_clips 已移除，替换为 --max_context_clips
@@ -1627,10 +1709,11 @@ def main():
     if args.gradient_checkpointing:
         enable_gradient_checkpointing(model)
 
-    # ---- 数据集（v4：CSGOMultiClipDataset 使用 max_context_clips）----
+    # ---- 数据集（v4：CSGOMultiClipDataset 使用 max_context_clips + phase）----
     dataset = CSGOMultiClipDataset(
         dataset_dir=args.dataset_dir,
         split="train",
+        phase=args.phase,
         max_context_clips=args.max_context_clips,  # Innovation 6: 使用 max_context_clips
         num_frames=args.num_frames,
         height=args.height,
@@ -1763,8 +1846,11 @@ def main():
                 # 先 forward 并同步 OOM 标志，确保所有 rank 一致决定跳过，避免 NCCL 死锁
                 _skip = torch.zeros(1, device=accelerator.device)
                 loss = None
+                _loss_components: Dict[str, float] = {
+                    "diffusion": 0.0, "nfp": 0.0, "vis_align": 0.0, "latent_proj": 0.0
+                }
                 try:
-                    loss = multi_clip_training_step(
+                    loss, _loss_components = multi_clip_training_step(
                         trainer,
                         accelerator.unwrap_model(model),
                         batch_clips,
@@ -1802,9 +1888,13 @@ def main():
                             lr_scheduler.step()
                         # W&B 步骤日志（梯度 norm 必须在 zero_grad 之前采集）
                         if wb_logger is not None and accelerator.sync_gradients:
+                            # M-01 修复：loss/diffusion 报告纯 diffusion loss（而非 total_loss）
                             _loss_dict = {
                                 "loss/total": loss.item(),
-                                "loss/diffusion": loss.item(),
+                                "loss/diffusion": _loss_components["diffusion"],
+                                "loss/nfp": _loss_components["nfp"],
+                                "loss/vis_align": _loss_components["vis_align"],
+                                "loss/latent_proj": _loss_components["latent_proj"],
                             }
                             wb_logger.log_step(
                                 global_step + 1,

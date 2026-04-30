@@ -18,7 +18,8 @@ set -euo pipefail
 #   - LONG_CAP 默认值改为 32（v4 扩容）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
-DATASET_DIR="/home/nvme02/lingbot-world/datasets/processed_csgo_v3"   # v3 数据集目录
+DATASET_DIR="/home/nvme02/Memory-dataset/v4_dynamic_all46"            # v4 数据集目录
+PHASE="exp"                  # 训练阶段："exp"（ep01-11）或 "full"（ep01-46）
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v4_stage1_dual"
 # RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
@@ -102,6 +103,7 @@ TRAIN_ARGS=(
     --ckpt_dir                    "${CKPT_DIR}"
     --dataset_dir                 "${DATASET_DIR}"
     --output_dir                  "${OUTPUT_DIR}"
+    --phase                       "${PHASE}"
     --stage                       1
     --learning_rate               "${LEARNING_RATE}"
     --lr_dit                      "${LR_DIT}"
@@ -143,6 +145,7 @@ TRAIN_SCRIPT="${PROJECT_ROOT}/src/pipeline/train_v4_stage1_dual.py"
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 双模型训练 v4 启动"
 echo "  实验配置 ⑦：v4（Innovations 6-10）"
+echo "  PHASE              : ${PHASE}"
 echo "  MAX_CONTEXT_CLIPS   : ${MAX_CONTEXT_CLIPS}"
 echo "  CONTEXT_DROP_P_MAX  : ${CONTEXT_DROP_P_MAX}"
 echo "  VISUAL_FUSION_ALPHA : ${VISUAL_FUSION_ALPHA}"
