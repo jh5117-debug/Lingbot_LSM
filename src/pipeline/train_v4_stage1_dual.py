@@ -1022,6 +1022,7 @@ def multi_clip_training_step(
     model: nn.Module,
     batch_clips: List[dict],
     args,
+    n_ctx: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """多 clip 顺序训练步骤（v4：Innovations 6/7/8/9/10）。
 
@@ -1064,8 +1065,10 @@ def multi_clip_training_step(
 
     # ----------------------------------------------------------------
     # Innovation 6：随机采样 n_ctx ~ Uniform(2, max_context_clips)
+    # n_ctx 由调用方在 broadcast 后传入（ZeRO-3 要求所有 rank forward 次数一致）
     # ----------------------------------------------------------------
-    n_ctx = random.randint(2, args.max_context_clips)
+    if n_ctx is None:
+        n_ctx = random.randint(2, args.max_context_clips)
     context_clips = batch_clips[:n_ctx]
     target_clip = batch_clips[n_ctx]
     # batch_clips[n_ctx+1:] 本 step 不使用
@@ -1844,6 +1847,15 @@ def main():
                 # batch_clips: List[dict] of max_context_clips+1 clips（来自 multi_clip_collate_fn）
                 # code_standards.md §2：OOM 防御（DDP-safe）
                 # 先 forward 并同步 OOM 标志，确保所有 rank 一致决定跳过，避免 NCCL 死锁
+                # ZeRO-3：所有 rank 必须执行相同次数的 model.forward()（等于 n_ctx 次 context clip）
+                # 若各 rank 独立采样 n_ctx，forward 次数不同 → allgather 序列错位 → NCCL 死锁
+                # 修复：rank 0 采样后 broadcast，所有 rank 使用同一 n_ctx
+                _n_ctx_t = torch.zeros(1, dtype=torch.long, device=accelerator.device)
+                if accelerator.is_main_process:
+                    _n_ctx_t[0] = random.randint(2, args.max_context_clips)
+                dist.broadcast(_n_ctx_t, src=0)
+                _synced_n_ctx = int(_n_ctx_t.item())
+
                 _skip = torch.zeros(1, device=accelerator.device)
                 loss = None
                 _loss_components: Dict[str, float] = {
@@ -1855,6 +1867,7 @@ def main():
                         accelerator.unwrap_model(model),
                         batch_clips,
                         args,
+                        n_ctx=_synced_n_ctx,
                     )
                 except torch.cuda.OutOfMemoryError:
                     try:
