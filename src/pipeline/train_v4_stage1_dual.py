@@ -1847,6 +1847,9 @@ def main():
             epoch_diffusion_loss = 0.0
             epoch_nfp_loss       = 0.0
             epoch_vis_loss       = 0.0
+            # 诊断 log 变量（每 epoch 重置）
+            _last_grad_norm: float = 0.0   # 修改4：pre-clip gradient norm
+            _last_gate_grad: float = 0.0   # 修改5：blocks[0] gate gradient
 
             progress = tqdm(
                 dataloader,
@@ -1906,7 +1909,13 @@ def main():
                     with accelerator.accumulate(model):
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                            _last_grad_norm = float(
+                                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                            )
+                            # 修改5：读 gate.grad（必须在 clip 之后、zero_grad 之前）
+                            _gate_param = accelerator.unwrap_model(model).blocks[0].memory_cross_attn.gate
+                            if _gate_param.grad is not None:
+                                _last_gate_grad = _gate_param.grad.item()
                         optimizer.step()
                         if accelerator.sync_gradients:
                             lr_scheduler.step()
@@ -1963,12 +1972,24 @@ def main():
                 )
 
                 if accelerator.is_main_process and global_step % 10 == 0:
-                    _gate_val = accelerator.unwrap_model(model).blocks[0].memory_cross_attn._last_gate_value
+                    # 修改1：多 block gate 值（blocks 0/10/20/39）
+                    _unwrapped = accelerator.unwrap_model(model)
+                    _gate_vals = [
+                        _unwrapped.blocks[idx].memory_cross_attn._last_gate_value
+                        for idx in (0, 10, 20, 39)
+                    ]
+                    # 修改2：attn_out_norm
+                    _attn_norm = _unwrapped.blocks[0].memory_cross_attn._last_attn_out_norm
                     logger.info(
-                        f"step {global_step} | n_ctx={_synced_n_ctx} | gate={_gate_val:.4f} | "
+                        f"step {global_step} | n_ctx={_synced_n_ctx} | "
+                        f"gates=[{_gate_vals[0]:.4f}, {_gate_vals[1]:.4f}, "
+                        f"{_gate_vals[2]:.4f}, {_gate_vals[3]:.4f}] | "
+                        f"attn_norm={_attn_norm:.4f} | "
+                        f"gate_grad={_last_gate_grad:.2e} | "
+                        f"grad_norm={_last_grad_norm:.3f} | "
                         f"bank=[{int(_loss_components.get('bank_short', 0))}s/"
                         f"{int(_loss_components.get('bank_medium', 0))}m/"
-                        f"{int(_loss_components.get('bank_long', 0))}l] "
+                        f"{int(_loss_components.get('bank_long', 0))}l/{args.long_cap}] "
                         f"retr={int(_loss_components.get('bank_retrieved_k', 0))} | "
                         f"loss={loss.item():.4f} "
                         f"(diff={_loss_components['diffusion']:.4f} "
