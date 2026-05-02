@@ -1835,6 +1835,16 @@ def main():
             start_global_step = meta.get("global_step", 0)
             logging.info(f"Resuming from epoch {start_epoch}, global_step {start_global_step}")
 
+    # gate gradient hook（ZeRO-3 下 param.grad 永远 None，需在 reduce-scatter 前用 hook 捕获）
+    _last_gate_grad: float = 0.0
+    def _gate_grad_hook(grad):
+        nonlocal _last_gate_grad
+        if grad is not None:
+            _last_gate_grad = grad.abs().item()
+    accelerator.unwrap_model(model).blocks[0].memory_cross_attn.gate.register_hook(
+        _gate_grad_hook
+    )
+
     # ---- 训练循环 ----
     global_step = start_global_step
     try:
@@ -1848,8 +1858,8 @@ def main():
             epoch_nfp_loss       = 0.0
             epoch_vis_loss       = 0.0
             # 诊断 log 变量（每 epoch 重置）
-            _last_grad_norm: float = 0.0   # 修改4：pre-clip gradient norm
-            _last_gate_grad: float = 0.0   # 修改5：blocks[0] gate gradient
+            _last_grad_norm: float = 0.0
+            _last_gate_grad = 0.0  # epoch 开始重置；hook 在 backward 时更新
 
             progress = tqdm(
                 dataloader,
@@ -1912,10 +1922,6 @@ def main():
                             _last_grad_norm = float(
                                 accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                             )
-                            # 修改5：读 gate.grad（必须在 clip 之后、zero_grad 之前）
-                            _gate_param = accelerator.unwrap_model(model).blocks[0].memory_cross_attn.gate
-                            if _gate_param.grad is not None:
-                                _last_gate_grad = _gate_param.grad.item()
                         optimizer.step()
                         if accelerator.sync_gradients:
                             lr_scheduler.step()
@@ -1982,8 +1988,8 @@ def main():
                     _attn_norm = _unwrapped.blocks[0].memory_cross_attn._last_attn_out_norm
                     logger.info(
                         f"step {global_step} | n_ctx={_synced_n_ctx} | "
-                        f"gates=[{_gate_vals[0]:.4f}, {_gate_vals[1]:.4f}, "
-                        f"{_gate_vals[2]:.4f}, {_gate_vals[3]:.4f}] | "
+                        f"gates=[{_gate_vals[0]:.6f}, {_gate_vals[1]:.6f}, "
+                        f"{_gate_vals[2]:.6f}, {_gate_vals[3]:.6f}] | "
                         f"attn_norm={_attn_norm:.4f} | "
                         f"gate_grad={_last_gate_grad:.2e} | "
                         f"grad_norm={_last_grad_norm:.3f} | "
