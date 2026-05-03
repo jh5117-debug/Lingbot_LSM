@@ -23,7 +23,7 @@ PHASE="exp"                  # 训练阶段："exp"（ep01-11）或 "full"（ep0
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v4_stage1_dual"
 # RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
-RESUME_FROM_LOW=""
+RESUME_FROM_LOW="/home/nvme02/wlx/Memory/outputs/train/v4_stage1_dual/low_noise_model/epoch_4"
 RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
 
 LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调
