@@ -12,8 +12,8 @@ set -euo pipefail
 #   - 新增 VISUAL_FUSION_ALPHA（Visual Feature Fusion，Innovation 9）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010/image.jpg"
-ACTION_PATH="/home/nvme02/Memory-world/data/csgo_val_clips_action4/val/clips/Ep_000028_team_3_player_0000_inst_000_clip0010"
+IMAGE=""          # 每次推理前填写：<clip目录>/image.jpg
+ACTION_PATH=""    # 每次推理前填写：<clip目录>
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
@@ -48,7 +48,7 @@ DUP_THRESHOLD=0.95       # cross-tier dedup 阈值
 VISUAL_FUSION_ALPHA=0.7    # v4 Visual Feature Fusion pose 权重（Innovation 9，default=0.7）
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0"                        # 推理单卡，通常无需修改
+CUDA_VISIBLE_DEVICES="0,1,2,3,4"               # 5 卡 Ulysses SP（40 heads ÷ 5 = 8）
 
 # ============================================================
 # 以下内容通常无需修改
