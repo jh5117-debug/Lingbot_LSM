@@ -1,3 +1,0 @@
-
-EnvironmentLocationNotFound: Not a conda environment: /u/lwu9/.conda/envs/lingbot-lsm
-
