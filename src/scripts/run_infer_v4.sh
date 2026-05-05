@@ -48,7 +48,7 @@ DUP_THRESHOLD=0.95       # cross-tier dedup 阈值
 VISUAL_FUSION_ALPHA=0.7    # v4 Visual Feature Fusion pose 权重（Innovation 9，default=0.7）
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
-CUDA_VISIBLE_DEVICES="0,1,2,3,4"               # 5 卡 Ulysses SP（40 heads ÷ 5 = 8）
+CUDA_VISIBLE_DEVICES="1,2,3,4,5"               # 5 卡 Ulysses SP（40 heads ÷ 5 = 8）
 
 # ============================================================
 # 以下内容通常无需修改
