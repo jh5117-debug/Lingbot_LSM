@@ -1024,16 +1024,26 @@ def main():
                 _boot_vae_device = next(wan_i2v.vae.model.parameters()).device
                 if _boot_vae_device != device:
                     wan_i2v.vae.model.to(device)
-                with torch.no_grad():
-                    _boot_latent = wan_i2v.vae.encode([_boot_img_t])[0]  # [z_dim, lat_f, h, w]
-                    _boot_vis = _boot_model.get_projected_latent_emb(
-                        _boot_latent[:, 0]     # 取第 0 帧（初始帧）
-                    )  # [5120]
-                _cached_query_visual_emb = _boot_vis.cpu()
-                logger.info(
-                    "M-2 修复：bootstrap _cached_query_visual_emb from initial image, "
-                    "shape=%s", tuple(_cached_query_visual_emb.shape)
-                )
+                # T5-FSDP offload 将 DiT 整体移到 CPU；临时将 latent_proj/visual_key_proj 移回 device
+                # finally 块确保无论是否异常都移回 CPU，避免破坏后续 T5-FSDP offload 状态
+                _boot_model.latent_proj.to(device)
+                if hasattr(_boot_model, 'visual_key_proj'):
+                    _boot_model.visual_key_proj.to(device)
+                try:
+                    with torch.no_grad():
+                        _boot_latent = wan_i2v.vae.encode([_boot_img_t])[0]  # [z_dim, lat_f, h, w]
+                        _boot_vis = _boot_model.get_projected_latent_emb(
+                            _boot_latent[:, 0]     # 取第 0 帧（初始帧）
+                        )  # [5120]
+                    _cached_query_visual_emb = _boot_vis.cpu()
+                    logger.info(
+                        "M-2 修复：bootstrap _cached_query_visual_emb from initial image, "
+                        "shape=%s", tuple(_cached_query_visual_emb.shape)
+                    )
+                finally:
+                    _boot_model.latent_proj.to('cpu')
+                    if hasattr(_boot_model, 'visual_key_proj'):
+                        _boot_model.visual_key_proj.to('cpu')
         except Exception as _boot_exc:
             logger.warning(
                 "M-2 修复：bootstrap visual_emb failed (%s); "
