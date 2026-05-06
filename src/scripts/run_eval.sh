@@ -28,7 +28,7 @@ PROMPT="First-person view of CS:GO competitive gameplay"
 # VBench 评测维度（对应论文 Table 2 的 6 个维度）
 DIMENSIONS="imaging_quality aesthetic_quality dynamic_degree motion_smoothness temporal_flickering subject_consistency"
 
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"   # 使用哪些 GPU
+CUDA_VISIBLE_DEVICES="1,2,3,4,5"   # 使用哪些 GPU
 
 # ============================================================
 # 以下内容通常无需修改
